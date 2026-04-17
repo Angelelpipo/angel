@@ -3,7 +3,7 @@
 A lightweight browser-based trading viewer for crypto pairs.
 
 ## Features
-- Live polling of Binance 24h ticker endpoint
+- Live polling with Binance primary source and Coinbase fallback
 - Symbol selection (example: `BTCUSDT`, `ETHUSDT`)
 - 1s / 2s / 5s refresh intervals
 - Price sparkline-style chart rendered with canvas

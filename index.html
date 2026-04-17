@@ -241,32 +241,81 @@
         ctx.stroke();
       }
 
-      async function fetchTicker() {
-        const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${state.symbol}`;
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+      function toCoinbaseProduct(symbol) {
+        const clean = symbol.replace(/[^A-Z]/g, "");
+        if (clean.endsWith("USDT")) return `${clean.slice(0, -4)}-USD`;
+        if (clean.endsWith("USD")) return `${clean.slice(0, -3)}-USD`;
+        return `${clean}-USD`;
+      }
 
-        const lastPrice = Number(data.lastPrice);
-        state.prices.push(lastPrice);
+      async function fetchBinanceTicker() {
+        const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(state.symbol)}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Binance HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.code && data.msg) {
+          throw new Error(data.msg);
+        }
+
+        return {
+          source: "Binance",
+          lastPrice: Number(data.lastPrice),
+          changePct: Number(data.priceChangePercent),
+          volume: Number(data.quoteVolume),
+        };
+      }
+
+      async function fetchCoinbaseTicker() {
+        const productId = toCoinbaseProduct(state.symbol);
+        const [tickerRes, statsRes] = await Promise.all([
+          fetch(`https://api.exchange.coinbase.com/products/${encodeURIComponent(productId)}/ticker`),
+          fetch(`https://api.exchange.coinbase.com/products/${encodeURIComponent(productId)}/stats`),
+        ]);
+
+        if (!tickerRes.ok) throw new Error(`Coinbase ticker HTTP ${tickerRes.status}`);
+        if (!statsRes.ok) throw new Error(`Coinbase stats HTTP ${statsRes.status}`);
+
+        const ticker = await tickerRes.json();
+        const stats = await statsRes.json();
+        const lastPrice = Number(ticker.price);
+        const openPrice = Number(stats.open);
+        const changePct = openPrice ? ((lastPrice - openPrice) / openPrice) * 100 : 0;
+
+        return {
+          source: `Coinbase (${productId})`,
+          lastPrice,
+          changePct,
+          volume: Number(stats.volume) * lastPrice,
+        };
+      }
+
+      async function fetchTicker() {
+        let quote;
+        try {
+          quote = await fetchBinanceTicker();
+        } catch (binanceError) {
+          quote = await fetchCoinbaseTicker();
+        }
+
+        state.prices.push(quote.lastPrice);
         if (state.prices.length > state.maxPoints) state.prices.shift();
 
-        refs.latestPrice.textContent = `$${fmt(lastPrice, 2)}`;
+        refs.latestPrice.textContent = `$${fmt(quote.lastPrice, 2)}`;
 
-        const pct = Number(data.priceChangePercent);
+        const pct = Number(quote.changePct);
         refs.change24.textContent = `${fmt(pct, 2)}%`;
         refs.change24.className = `value ${pct >= 0 ? "up" : "down"}`;
 
-        refs.volume24.textContent = fmt(data.quoteVolume, 0);
+        refs.volume24.textContent = fmt(quote.volume, 0);
         refs.lastUpdate.textContent = new Date().toLocaleTimeString();
 
+        setStatus(`running (${state.symbol}) via ${quote.source}`);
         drawChart();
       }
 
       async function tick() {
         try {
           await fetchTicker();
-          setStatus(`running (${state.symbol})`);
         } catch (err) {
           setStatus(`error: ${err.message}`);
         }
