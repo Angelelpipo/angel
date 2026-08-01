@@ -289,7 +289,14 @@ var int   lastSweepSide  = 0    // +1 barrido arriba (→ setup bajista)
 // ROTURA  → perforó y se quedó fuera: la liquidez se cobró pero el movimiento
 //           era real. Es continuación.
 // Confundirlas es la forma más rápida de perder dinero con esta lógica.
+// Pine prohíbe modificar variables globales desde dentro de una función, así
+// que el barrido se DEVUELVE y se asigna fuera.
 resolvePools(array<Pool> arr, int side) =>
+    float swPx    = na
+    float swScore = 0.0
+    float swExt   = na
+    int   swBar   = -1
+    int   swSide  = 0
     int n = array.size(arr)
     if n > 0
         for i = 0 to n - 1
@@ -307,14 +314,15 @@ resolvePools(array<Pool> arr, int side) =>
                         // Barrer un nivel que no le importa a nadie no es una
                         // trampa, es ruido.
                         if p.score >= minPoolScore
-                            lastSweepPx    := p.price
-                            lastSweepScore := p.score
-                            lastSweepExt   := side == 1 ? high : low
-                            lastSweepBar   := bar_index
-                            lastSweepSide  := side
+                            swPx    := p.price
+                            swScore := p.score
+                            swExt   := side == 1 ? high : low
+                            swBar   := bar_index
+                            swSide  := side
                     else if bar_index - p.raidBar >= reclaimBars
                         p.outcome := 2
                         p.outBar  := bar_index
+    [swPx, swScore, swExt, swBar, swSide]
 
 prune(array<Pool> arr) =>
     int n = array.size(arr)
@@ -358,8 +366,19 @@ if barstate.isconfirmed
     if nd > 0
         for i = 0 to nd - 1
             array.get(poolsDn, i).rescore()
-    resolvePools(poolsUp, 1)
-    resolvePools(poolsDn, -1)
+    [uPx, uSc, uExt, uBar, uSide] = resolvePools(poolsUp, 1)
+    [dPx, dSc, dExt, dBar, dSide] = resolvePools(poolsDn, -1)
+    bool hasU = uBar == bar_index
+    bool hasD = dBar == bar_index
+    if hasU or hasD
+        // Si ambos lados se barren en la misma barra, manda el de más
+        // magnetismo: ése es la trampa, el otro es la sacudida que la acompaña.
+        bool useDn = hasD and (not hasU or dSc > uSc)
+        lastSweepPx    := useDn ? dPx  : uPx
+        lastSweepScore := useDn ? dSc  : uSc
+        lastSweepExt   := useDn ? dExt : uExt
+        lastSweepSide  := useDn ? dSide : uSide
+        lastSweepBar   := bar_index
     prune(poolsUp)
     prune(poolsDn)
 
