@@ -1,0 +1,339 @@
+//@version=6
+//══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATOR ENGINE · MÓDULO 02 — ÍNDICE DE MANIPULABILIDAD
+//══════════════════════════════════════════════════════════════════════════════
+//  Qué hace:
+//    Mide cuán manipulable es un activo ANTES de operarlo, y rankea una lista
+//    de símbolos para decir dónde hay comida esta semana.
+//
+//  Por qué existe:
+//    El activo manipulable rota. Fijar un símbolo para siempre es una decisión
+//    arbitraria; dejar que la data elija es una decisión medible. Un motor que
+//    caza trampas necesita un mercado que tienda trampas — si el activo no las
+//    tiende, no hay materia prima y no hay estrategia que valga.
+//
+//  Seis componentes:
+//    1. COMBUSTIBLE     · Open Interest relativo al volumen. Apalancamiento por
+//                         cada dólar real negociado. Ratio alto = mucha
+//                         gasolina para una cascada de liquidaciones.
+//    2. POSICIONAMIENTO · Funding. Con qué violencia y frecuencia la manada se
+//                         apila de un lado.
+//    3. BARRIDOS        · Cuántas veces este activo perfora un extremo obvio y
+//                         cierra de vuelta. La prueba empírica de que el patrón
+//                         vive aquí.
+//    4. RECHAZO         · Dominancia de mecha. Cuánto del recorrido se deshace.
+//    5. INEFICIENCIA    · Cuánto camina el precio para llegar a ningún sitio.
+//    6. OBVIEDAD        · Densidad de extremos iguales. Cuán legible es el
+//                         gráfico para el retail — y por tanto cuán cebado está.
+//
+//  Los componentes 3-6 salen solo de precio y volumen, así que se pueden
+//  calcular sobre cualquier símbolo: eso es lo que hace posible el escáner.
+//  Los componentes 1-2 requieren datos de derivados y solo aplican al símbolo
+//  del gráfico; si el feed no resuelve, el índice se renormaliza sobre lo
+//  disponible en vez de mentir con ceros.
+//══════════════════════════════════════════════════════════════════════════════
+
+indicator("Manipulator Engine 02 · Índice de Manipulabilidad", "ME·MANIP", overlay = false)
+
+//──────────────────────────────────── ENTRADAS ────────────────────────────────
+var string GW = "1 · Ventana"
+lookbackDays = input.int(30, "Días de historia", minval = 3, maxval = 365, group = GW)
+swN          = input.int(20, "Barras que definen un extremo obvio", minval = 3, group = GW)
+volLen       = input.int(48, "Barras para la unidad de volatilidad", minval = 5, group = GW)
+
+var string GX = "2 · Feeds de derivados"
+oiInput   = input.string("", "Ticker de Open Interest (vacío = automático)", group = GX,
+     tooltip = "Automático prueba <símbolo>_OI. En Binance perp suele ser BINANCE:BTCUSDT.P_OI. Si tu proveedor usa otro sufijo, pégalo aquí. El panel indica si el feed resolvió.")
+fundInput = input.string("", "Ticker de Funding (vacío = automático)", group = GX,
+     tooltip = "Automático prueba <símbolo>_FUNDING. Verifica el ticker exacto en tu proveedor; si no existe, su peso se reparte entre el resto de componentes.")
+oiDeltaN  = input.int(24, "Barras para leer el flujo de OI", minval = 2, group = GX)
+
+var string GN = "3 · Normalización (anclas 0 → 100)"
+sweepLo = input.float(1.0,  "Barridos/100 barras → 0",           minval = 0,   step = 0.5,  group = GN)
+sweepHi = input.float(8.0,  "Barridos/100 barras → 100",         minval = 0.1, step = 0.5,  group = GN)
+wickLo  = input.float(0.30, "Mecha media → 0",                   minval = 0, maxval = 1, step = 0.05, group = GN)
+wickHi  = input.float(0.70, "Mecha media → 100",                 minval = 0, maxval = 1, step = 0.05, group = GN)
+ineffLo = input.float(0.75, "Ineficiencia → 0",                  minval = 0, maxval = 1, step = 0.01, group = GN)
+ineffHi = input.float(0.98, "Ineficiencia → 100",                minval = 0, maxval = 1, step = 0.01, group = GN)
+eqLo    = input.float(2.0,  "Extremos iguales/100 barras → 0",   minval = 0,   step = 0.5,  group = GN)
+eqHi    = input.float(15.0, "Extremos iguales/100 barras → 100", minval = 0.1, step = 0.5,  group = GN)
+
+var string GP = "4 · Pesos"
+wFuel  = input.float(22, "Combustible (OI/volumen)",  minval = 0, maxval = 100, group = GP)
+wPos   = input.float(18, "Posicionamiento (funding)", minval = 0, maxval = 100, group = GP)
+wSweep = input.float(22, "Barridos",                  minval = 0, maxval = 100, group = GP)
+wWick  = input.float(14, "Rechazo",                   minval = 0, maxval = 100, group = GP)
+wIneff = input.float(12, "Ineficiencia",              minval = 0, maxval = 100, group = GP)
+wEq    = input.float(12, "Obviedad",                  minval = 0, maxval = 100, group = GP)
+
+var string GS = "5 · Escáner multi-activo"
+scanOn = input.bool(true, "Mostrar escáner", group = GS)
+scanTF = input.timeframe("60", "Temporalidad del escáner", group = GS)
+scanLB = input.int(500, "Barras de historia del escáner", minval = 100, maxval = 4000, group = GS,
+     tooltip = "500 barras en 1H ≈ 20 días. Subirlo mejora la muestra y ralentiza el script.")
+s01 = input.symbol("BINANCE:BTCUSDT.P",  "01", group = GS)
+s02 = input.symbol("BINANCE:ETHUSDT.P",  "02", group = GS)
+s03 = input.symbol("BINANCE:SOLUSDT.P",  "03", group = GS)
+s04 = input.symbol("BINANCE:BNBUSDT.P",  "04", group = GS)
+s05 = input.symbol("BINANCE:XRPUSDT.P",  "05", group = GS)
+s06 = input.symbol("BINANCE:DOGEUSDT.P", "06", group = GS)
+s07 = input.symbol("BINANCE:AVAXUSDT.P", "07", group = GS)
+s08 = input.symbol("BINANCE:LINKUSDT.P", "08", group = GS)
+s09 = input.symbol("BINANCE:ADAUSDT.P",  "09", group = GS)
+s10 = input.symbol("BINANCE:SUIUSDT.P",  "10", group = GS)
+
+//──────────────────────────────── UTILIDADES ──────────────────────────────────
+// Reescala entre dos anclas y recorta a 0-100. Sin umbrales en dólares: o todo
+// es relativo, o el índice compara precios en vez de comparar comportamientos.
+norm(float v, float lo, float hi) =>
+    na(v) ? na : math.max(0.0, math.min(100.0, (v - lo) / math.max(hi - lo, 1e-8) * 100.0))
+
+// "BINANCE:SOLUSDT.P" → "SOLUSDT.P"
+shortName(string s) =>
+    array<string> parts = str.split(s, ":")
+    array.size(parts) > 1 ? array.get(parts, array.size(parts) - 1) : s
+
+int barSecs  = math.max(timeframe.in_seconds(timeframe.period), 1)
+int lookback = math.min(math.max(int(lookbackDays * 86400 / barSecs), 30), 4000)
+
+//──────────────── NÚCLEO ESTRUCTURAL (precio y volumen, portable) ─────────────
+// Los cuatro componentes que no necesitan datos de derivados. Al ser función
+// pura de precio y volumen se puede evaluar dentro de request.security sobre
+// cualquier símbolo.
+structCore(int lb, int n, int vl) =>
+    float tr = na(close[1]) ? high - low
+         : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+    float vu = math.max(math.sum(tr, vl) / vl, syminfo.mintick)
+
+    // — Barridos: perforar el extremo de n barras y cerrar de vuelta dentro.
+    //   Es la definición mínima de una trampa, sin adornos.
+    float hh  = ta.highest(high, n)[1]
+    float ll  = ta.lowest(low,   n)[1]
+    float swU = (not na(hh) and high > hh and close < hh) ? 1.0 : 0.0
+    float swD = (not na(ll) and low  < ll and close > ll) ? 1.0 : 0.0
+    float sweepRate = math.sum(swU + swD, lb) / lb * 100.0
+
+    // — Rechazo: qué fracción del recorrido de cada barra se deshizo.
+    float rng = high - low
+    float wk  = rng <= 0 ? 0.0
+         : ((high - math.max(open, close)) + (math.min(open, close) - low)) / rng
+    float wickAvg = math.sum(wk, lb) / lb
+
+    // — Ineficiencia: camino recorrido frente a distancia neta. 0.95 significa
+    //   que el precio anduvo veinte veces lo que avanzó: puro ir y venir.
+    float net   = math.abs(close - close[lb])
+    float path  = math.sum(math.abs(close - close[1]), lb)
+    float ineff = path > 0 ? 1.0 - net / path : 0.0
+
+    // — Obviedad: con qué frecuencia el precio vuelve a clavar el mismo extremo.
+    //   Dobles techos y suelos limpios son el cebo más barato que existe.
+    float eqH = (not na(hh) and math.abs(high - hh) <= vu * 0.25) ? 1.0 : 0.0
+    float eqL = (not na(ll) and math.abs(low  - ll) <= vu * 0.25) ? 1.0 : 0.0
+    float eqRate = math.sum(eqH + eqL, lb) / lb * 100.0
+
+    [sweepRate, wickAvg, ineff, eqRate]
+
+// Índice estructural comprimido (0-100) para el escáner.
+structIndex(int lb, int n, int vl) =>
+    [sr, wa, inf, eq] = structCore(lb, n, vl)
+    float a    = norm(sr,  sweepLo, sweepHi)
+    float b    = norm(wa,  wickLo,  wickHi)
+    float c    = norm(inf, ineffLo, ineffHi)
+    float d    = norm(eq,  eqLo,    eqHi)
+    float wsum = math.max(wSweep + wWick + wIneff + wEq, 1e-8)
+    float idx  = (a * wSweep + b * wWick + c * wIneff + d * wEq) / wsum
+    [idx, sr, wa]
+
+//─────────────────────────── SÍMBOLO DEL GRÁFICO ──────────────────────────────
+[sweepRate, wickAvg, ineff, eqRate] = structCore(lookback, swN, volLen)
+
+float cSweep = norm(sweepRate, sweepLo, sweepHi)
+float cWick  = norm(wickAvg,   wickLo,  wickHi)
+float cIneff = norm(ineff,     ineffLo, ineffHi)
+float cEq    = norm(eqRate,    eqLo,    eqHi)
+
+//──────────────────────── COMBUSTIBLE Y POSICIONAMIENTO ───────────────────────
+// Open Interest y funding son lo más cerca que se puede estar de leer la mente
+// de la multitud sin adivinar: no son un proxy del posicionamiento, SON el
+// posicionamiento.
+string oiSym   = oiInput   == "" ? syminfo.tickerid + "_OI"      : oiInput
+string fundSym = fundInput == "" ? syminfo.tickerid + "_FUNDING" : fundInput
+
+float oi   = request.security(oiSym,   timeframe.period, close, ignore_invalid_symbol = true)
+float fund = request.security(fundSym, timeframe.period, close, ignore_invalid_symbol = true)
+
+bool hasOI   = not na(oi)
+bool hasFund = not na(fund)
+
+// COMBUSTIBLE: contrato abierto por cada unidad de volumen negociado. Se
+// percentila contra su propia historia porque el nivel absoluto no significa
+// nada al comparar entre activos.
+float volMA   = math.max(math.sum(volume, lookback) / lookback, 1e-8)
+float oiRatio = hasOI ? oi / volMA : na
+float cFuel   = hasOI ? ta.percentrank(oiRatio, lookback) : na
+
+// POSICIONAMIENTO: no importa el signo del funding, importa su violencia y su
+// inestabilidad. Un funding que salta de un extremo a otro es una manada que no
+// para de reposicionarse — y a la que se puede cobrar repetidamente.
+float fundAbs = hasFund ? math.abs(fund) : na
+float fundVol = hasFund ? ta.stdev(fund, lookback) : na
+float cPosA   = hasFund ? ta.percentrank(fundAbs, lookback) : na
+float cPosB   = hasFund ? ta.percentrank(fundVol, lookback) : na
+float cPos    = hasFund ? (cPosA + cPosB) / 2.0 : na
+
+// Lectura direccional del flujo de OI: quién se está apilando ahora mismo.
+// Precio arriba + OI arriba = largos entrando apalancados → el combustible está
+// DEBAJO. Precio moviéndose con OI cayendo = solo cierres, movimiento sin
+// gasolina, poco fiable.
+float  dPrice = close - close[oiDeltaN]
+float  dOI    = hasOI ? oi - oi[oiDeltaN] : na
+string crowd  = not hasOI ? "sin datos"
+     : dOI > 0 and dPrice > 0 ? "LARGOS APILÁNDOSE → combustible abajo"
+     : dOI > 0 and dPrice < 0 ? "CORTOS APILÁNDOSE → combustible arriba"
+     : dOI < 0 and dPrice > 0 ? "cortos cerrando → subida sin gasolina"
+     : dOI < 0 and dPrice < 0 ? "largos cerrando → bajada sin gasolina"
+     : "plano"
+
+//──────────────── ÍNDICE FINAL CON RENORMALIZACIÓN HONESTA ────────────────────
+// Si falta un feed, su peso se reparte entre los que sí existen. Nunca se
+// sustituye por cero: un dato ausente no es un dato bajo.
+float accW = wSweep + wWick + wIneff + wEq
+float accV = wSweep * cSweep + wWick * cWick + wIneff * cIneff + wEq * cEq
+if not na(cFuel)
+    accW += wFuel
+    accV += wFuel * cFuel
+if not na(cPos)
+    accW += wPos
+    accV += wPos * cPos
+
+float  manipIndex = accW > 0 ? accV / accW : na
+string verdict    = manipIndex >= 70 ? "ALTA" : manipIndex >= 45 ? "MEDIA" : "BAJA"
+
+//──────────────────────────────── PLOT ────────────────────────────────────────
+color cIdx = manipIndex >= 70 ? color.new(#ef5350, 0)
+     : manipIndex >= 45 ? color.new(#ffa726, 0) : color.new(#787b86, 0)
+
+plot(manipIndex, "Índice de manipulabilidad", cIdx, 2)
+hline(70, "Alta",  color.new(#ef5350, 60), hline.style_dotted)
+hline(45, "Media", color.new(#ffa726, 60), hline.style_dotted)
+bgcolor(color.new(cIdx, 92))
+
+plot(cSweep, "· Barridos",     display = display.data_window)
+plot(cWick,  "· Rechazo",      display = display.data_window)
+plot(cIneff, "· Ineficiencia", display = display.data_window)
+plot(cEq,    "· Obviedad",     display = display.data_window)
+plot(cFuel,  "· Combustible",  display = display.data_window)
+plot(cPos,   "· Posicionam.",  display = display.data_window)
+
+//────────────────────────── PANEL DEL SÍMBOLO ─────────────────────────────────
+var table pnl = table.new(position.top_right, 3, 10,
+     border_color = color.new(color.gray, 70), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+bar10(float v) =>
+    int f = na(v) ? 0 : math.max(math.min(int(v / 10), 10), 0)
+    na(v) ? "n/d" : str.repeat("█", f) + str.repeat("·", 10 - f)
+
+crow(int r, string k, float v, string raw) =>
+    color cv = na(v) ? color.new(color.gray, 40) : v >= 70 ? #ef5350 : v >= 45 ? #ffa726 : #787b86
+    table.cell(pnl, 0, r, k,       text_size = size.small, text_color = color.new(color.gray, 10), text_halign = text.align_left,  bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 1, r, bar10(v),text_size = size.small, text_color = cv,                        text_halign = text.align_left,  bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 2, r, raw,     text_size = size.small, text_color = cv,                        text_halign = text.align_right, bgcolor = color.new(color.black, 82))
+
+trow(int r, string k, string v, color cv) =>
+    table.cell(pnl, 0, r, k, text_size = size.small, text_color = color.new(color.gray, 10), text_halign = text.align_left, bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 1, r, v, text_size = size.small, text_color = cv,                        text_halign = text.align_left, bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 2, r, "", bgcolor = color.new(color.black, 82))
+
+if barstate.islast
+    table.cell(pnl, 0, 0, "MANIPULABILIDAD", text_size = size.small, text_color = color.white, text_halign = text.align_left,   bgcolor = color.new(color.blue, 55))
+    table.cell(pnl, 1, 0, syminfo.ticker,    text_size = size.small, text_color = color.white, text_halign = text.align_center, bgcolor = color.new(color.blue, 55))
+    table.cell(pnl, 2, 0, str.tostring(manipIndex, "#") + " " + verdict, text_size = size.small, text_color = color.white, text_halign = text.align_right, bgcolor = color.new(color.blue, 55))
+
+    crow(1, "Combustible OI/vol", cFuel,  hasOI   ? str.tostring(cFuel, "#") : "feed n/d")
+    crow(2, "Posicionamiento",    cPos,   hasFund ? str.tostring(cPos,  "#") : "feed n/d")
+    crow(3, "Barridos /100b",     cSweep, str.tostring(sweepRate, "#.#"))
+    crow(4, "Rechazo (mecha)",    cWick,  str.tostring(wickAvg * 100, "#") + "%")
+    crow(5, "Ineficiencia",       cIneff, str.tostring(ineff * 100, "#") + "%")
+    crow(6, "Obviedad /100b",     cEq,    str.tostring(eqRate, "#.#"))
+
+    trow(7, "Manada",  crowd, color.new(color.yellow, 10))
+    trow(8, "Muestra", str.tostring(lookback) + " barras · " + timeframe.period, color.new(color.gray, 10))
+    trow(9, "Feeds",   "OI " + (hasOI ? "✓" : "✗") + "   Funding " + (hasFund ? "✓" : "✗"),
+         (hasOI and hasFund) ? #26a69a : #ffa726)
+
+//──────────────────────────── ESCÁNER MULTI-ACTIVO ────────────────────────────
+// La pregunta correcta no es "¿opero BTC?" sino "¿dónde hay comida ahora?".
+// Las llamadas van en ámbito global a propósito: request.security no debe
+// depender de una condición para evaluarse.
+[i01, r01, k01] = request.security(s01, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i02, r02, k02] = request.security(s02, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i03, r03, k03] = request.security(s03, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i04, r04, k04] = request.security(s04, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i05, r05, k05] = request.security(s05, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i06, r06, k06] = request.security(s06, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i07, r07, k07] = request.security(s07, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i08, r08, k08] = request.security(s08, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i09, r09, k09] = request.security(s09, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+[i10, r10, k10] = request.security(s10, scanTF, structIndex(scanLB, swN, volLen), ignore_invalid_symbol = true)
+
+var table scan = table.new(position.bottom_right, 4, 12,
+     border_color = color.new(color.gray, 70), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+if scanOn and barstate.islast
+    array<string> nm = array.new<string>()
+    array<float>  ix = array.new<float>()
+    array<float>  sw = array.new<float>()
+    array<float>  wk = array.new<float>()
+
+    array<string> syms = array.from(s01, s02, s03, s04, s05, s06, s07, s08, s09, s10)
+    array<float>  idxs = array.from(i01, i02, i03, i04, i05, i06, i07, i08, i09, i10)
+    array<float>  swps = array.from(r01, r02, r03, r04, r05, r06, r07, r08, r09, r10)
+    array<float>  wcks = array.from(k01, k02, k03, k04, k05, k06, k07, k08, k09, k10)
+
+    for i = 0 to 9
+        if not na(array.get(idxs, i))
+            array.push(nm, shortName(array.get(syms, i)))
+            array.push(ix, array.get(idxs, i))
+            array.push(sw, array.get(swps, i))
+            array.push(wk, array.get(wcks, i))
+
+    table.cell(scan, 0, 0, "ESCÁNER",  text_size = size.tiny, text_color = color.white, text_halign = text.align_left,  bgcolor = color.new(color.purple, 45))
+    table.cell(scan, 1, 0, "ÍNDICE",   text_size = size.tiny, text_color = color.white, text_halign = text.align_right, bgcolor = color.new(color.purple, 45))
+    table.cell(scan, 2, 0, "BARR/100", text_size = size.tiny, text_color = color.white, text_halign = text.align_right, bgcolor = color.new(color.purple, 45))
+    table.cell(scan, 3, 0, "MECHA",    text_size = size.tiny, text_color = color.white, text_halign = text.align_right, bgcolor = color.new(color.purple, 45))
+
+    // Orden por selección: con diez elementos el coste es irrelevante y evita
+    // depender de nada externo.
+    int n = array.size(ix)
+    if n > 0
+        array<int>  order = array.new<int>()
+        array<bool> used  = array.new<bool>(n, false)
+        for k = 0 to n - 1
+            int   bi = -1
+            float bv = -1.0
+            for i = 0 to n - 1
+                if not array.get(used, i) and array.get(ix, i) > bv
+                    bv := array.get(ix, i)
+                    bi := i
+            if bi >= 0
+                array.set(used, bi, true)
+                array.push(order, bi)
+
+        int rows = math.min(array.size(order), 11)
+        if rows > 0
+            for r = 0 to rows - 1
+                int   i  = array.get(order, r)
+                float v  = array.get(ix, i)
+                color cv = v >= 70 ? #ef5350 : v >= 45 ? #ffa726 : #787b86
+                bool  me = str.contains(syminfo.tickerid, array.get(nm, i))
+                color bg = me ? color.new(color.blue, 65) : color.new(color.black, 82)
+                table.cell(scan, 0, r + 1, (me ? "▶ " : "") + array.get(nm, i),                text_size = size.tiny, text_color = color.new(color.gray, 5), text_halign = text.align_left,  bgcolor = bg)
+                table.cell(scan, 1, r + 1, str.tostring(v, "#"),                               text_size = size.tiny, text_color = cv,                       text_halign = text.align_right, bgcolor = bg)
+                table.cell(scan, 2, r + 1, str.tostring(array.get(sw, i), "#.#"),              text_size = size.tiny, text_color = color.new(color.gray, 5), text_halign = text.align_right, bgcolor = bg)
+                table.cell(scan, 3, r + 1, str.tostring(array.get(wk, i) * 100, "#") + "%",    text_size = size.tiny, text_color = color.new(color.gray, 5), text_halign = text.align_right, bgcolor = bg)
+
+//──────────────────────────────── ALERTAS ─────────────────────────────────────
+alertcondition(ta.crossover(manipIndex, 70),  "Manipulabilidad ALTA", "El activo entró en régimen de alta manipulabilidad")
+alertcondition(ta.crossunder(manipIndex, 45), "Manipulabilidad BAJA", "El activo dejó de tender trampas — el motor se queda sin materia prima")

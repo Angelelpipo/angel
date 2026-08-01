@@ -1,0 +1,490 @@
+//@version=6
+//══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATOR ENGINE · MÓDULO 01 — MAPA DE LIQUIDEZ
+//══════════════════════════════════════════════════════════════════════════════
+//  Qué hace:
+//    Construye un mapa de los depósitos de liquidez (stops acumulados) de los
+//    últimos N días y los puntúa por "magnetismo": cuánto imán ejerce cada zona
+//    sobre el precio desde el punto de vista de quien necesita llenar tamaño.
+//
+//  Premisa:
+//    Un stop-loss es una orden de mercado dormida. Un grupo de stops es un
+//    depósito de liquidez. Las órdenes grandes no se llenan donde no hay
+//    contraparte, así que el precio viaja hacia donde está esa contraparte.
+//    No predecimos dirección: mapeamos combustible.
+//
+//  Nomenclatura:
+//    · BUY-SIDE  (arriba del precio)  = stops de cortos + órdenes de ruptura al alza
+//    · SELL-SIDE (abajo del precio)   = stops de largos + órdenes de ruptura a la baja
+//
+//  Construido desde primitivas: precio, volumen y tiempo. Sin osciladores,
+//  sin medias como señal, sin librerías de terceros.
+//══════════════════════════════════════════════════════════════════════════════
+
+indicator("Manipulator Engine 01 · Mapa de Liquidez", "ME·MAP", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+//──────────────────────────────────── ENTRADAS ────────────────────────────────
+var string GW = "1 · Ventana"
+lookbackDays = input.int(30,  "Días de historia",                        minval = 1, maxval = 365, group = GW)
+volLen       = input.int(48,  "Barras para la unidad de volatilidad",    minval = 5,               group = GW)
+
+var string GD = "2 · Detección"
+swingLen     = input.int(5,      "Fuerza del swing (barras a cada lado)",  minval = 1, maxval = 50,  group = GD)
+clusterTol   = input.float(0.35, "Tolerancia de cluster (× volatilidad)",  minval = 0.01, step = 0.05, group = GD)
+tightTol     = input.float(0.80, "Umbral de máximos iguales (× volat.)",   minval = 0.05, step = 0.05, group = GD)
+reclaimBars  = input.int(3,      "Barras para separar barrido de ruptura", minval = 1,               group = GD)
+maxPools     = input.int(10,     "Pools vivos por lado",                   minval = 2, maxval = 40,  group = GD)
+useStruct    = input.bool(true,  "Añadir niveles estructurales (PDH/PDL/PWH/PWL)",                   group = GD)
+
+var string GS = "3 · Scoring de magnetismo"
+wTouch       = input.float(25, "Peso · toques acumulados",   minval = 0, maxval = 100, group = GS)
+wTight       = input.float(20, "Peso · igualdad (obviedad)", minval = 0, maxval = 100, group = GS)
+wVol         = input.float(20, "Peso · volumen atrapado",    minval = 0, maxval = 100, group = GS)
+wRound       = input.float(15, "Peso · número redondo",      minval = 0, maxval = 100, group = GS)
+wProx        = input.float(20, "Peso · proximidad",          minval = 0, maxval = 100, group = GS)
+proxDecay    = input.float(10.0, "Decaimiento de proximidad (× volatilidad)", minval = 1, step = 0.5, group = GS)
+roundManual  = input.float(0.0,  "Paso de número redondo (0 = automático)",   minval = 0,            group = GS)
+
+var string GV = "4 · Visual"
+showPools    = input.bool(true,  "Dibujar pools",                group = GV)
+showConsumed = input.bool(true,  "Dibujar pools ya consumidos",  group = GV)
+showLabels   = input.bool(true,  "Etiquetas",                    group = GV)
+showRange    = input.bool(true,  "Rango operativo y equilibrio", group = GV)
+showTable    = input.bool(true,  "Panel de lectura",             group = GV)
+minScoreDraw = input.float(0.0,  "Score mínimo para dibujar", minval = 0, maxval = 100, group = GV)
+colBuy       = input.color(color.new(#26a69a, 0),  "Color buy-side",   group = GV)
+colSell      = input.color(color.new(#ef5350, 0),  "Color sell-side",  group = GV)
+colDead      = input.color(color.new(#787b86, 55), "Color consumido",  group = GV)
+
+//──────────────────────── UNIDAD DE VOLATILIDAD (propia) ──────────────────────
+// Rango verdadero medio calculado a mano. No es un indicador de señal: es el
+// metro con el que medimos distancias, para que todo umbral sea relativo al
+// activo y no un número mágico en dólares.
+float trueRange = na(close[1]) ? high - low
+     : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+float volUnit   = math.max(math.sum(trueRange, volLen) / volLen, syminfo.mintick)
+
+// Ventana en barras a partir de días reales de calendario.
+int   barSecs  = math.max(timeframe.in_seconds(timeframe.period), 1)
+int   lookback = math.min(math.max(int(lookbackDays * 86400 / barSecs), 20), 5000)
+float avgVol   = math.max(math.sum(volume, lookback) / lookback, 1e-8)
+
+//──────────────────────────── PASO DE NÚMERO REDONDO ──────────────────────────
+// Los números que la gente recuerda son los números donde la gente deja
+// órdenes. El paso se deriva de la magnitud del precio para que funcione igual
+// en un activo de 0.05 que en uno de 100.000.
+roundStep(float px) =>
+    float d = math.floor(math.log10(math.max(math.abs(px), 1e-12)))
+    math.pow(10, d - 1)
+
+float stepMajor = roundManual > 0 ? roundManual : roundStep(close)
+float stepMinor = stepMajor / 10.0
+
+// Cercanía a número redondo: 1.0 justo sobre el número, 0 a media distancia.
+roundPull(float px) =>
+    float dMaj = math.abs(px - math.round(px / stepMajor) * stepMajor) / math.max(stepMajor / 2.0, 1e-12)
+    float dMin = math.abs(px - math.round(px / stepMinor) * stepMinor) / math.max(stepMinor / 2.0, 1e-12)
+    math.max(1.0 - math.min(dMaj, 1.0), 0.5 * (1.0 - math.min(dMin, 1.0)))
+
+//──────────────────────────────── TIPO: POOL ──────────────────────────────────
+// Un pool es un depósito de liquidez: el sitio donde sabemos que hay órdenes
+// dormidas. Guardamos su historia porque la historia es lo que le da peso.
+type Pool
+    float price                  // precio representativo del cluster
+    int   side                   // +1 = buy-side (arriba) | -1 = sell-side (abajo)
+    int   touches    = 1         // cuántas veces el precio dejó un extremo aquí
+    float pmin       = na        // extremo inferior de los miembros del cluster
+    float pmax       = na        // extremo superior de los miembros del cluster
+    float volAcc     = 0.0       // volumen rechazado acumulado en los toques
+    int   bornBar    = 0
+    int   lastBar    = 0
+    bool  structural = false     // PDH / PDL / PWH / PWL
+    bool  raided     = false     // el precio ya perforó el nivel
+    int   raidBar    = 0
+    int   outcome    = 0         // 0 = intacto | 1 = BARRIDO (trampa) | 2 = ROTO
+    int   outBar     = 0
+    float score      = 0.0
+    line  ln         = na
+    label lb         = na
+
+var array<Pool> poolsUp = array.new<Pool>()
+var array<Pool> poolsDn = array.new<Pool>()
+
+// Evidencia acumulada: cuántas trampas ha tendido este activo en la ventana.
+var int sweepsUp = 0
+var int sweepsDn = 0
+var int breaksUp = 0
+var int breaksDn = 0
+
+//──────────────────── DETECCIÓN DE SWING (implementación propia) ──────────────
+// Un swing high es un extremo local: nada a su alrededor lo supera. La
+// comparación a los lados es estricta (>) para que los máximos IGUALES no se
+// descarten — son justamente los que más interesan, porque un doble techo
+// perfecto es un cartel de neón que anuncia dónde están los stops.
+isSwingHigh(int L) =>
+    bool ok = true
+    float p = high[L]
+    if na(p)
+        ok := false
+    else
+        for i = 0 to 2 * L
+            if i != L and high[i] > p
+                ok := false
+                break
+    ok
+
+isSwingLow(int L) =>
+    bool ok = true
+    float p = low[L]
+    if na(p)
+        ok := false
+    else
+        for i = 0 to 2 * L
+            if i != L and low[i] < p
+                ok := false
+                break
+    ok
+
+// Proporción de mecha: cuánto del recorrido de la barra fue rechazado. Volumen
+// alto con mecha larga = mucha gente entró y quedó del lado equivocado.
+wickShare(int off) =>
+    float rng = high[off] - low[off]
+    rng <= 0 ? 0.0 :
+     ((high[off] - math.max(open[off], close[off])) + (math.min(open[off], close[off]) - low[off])) / rng
+
+//──────────────────────── ALTA Y FUSIÓN DE POOLS ──────────────────────────────
+// Si un nuevo extremo cae dentro de la tolerancia de un pool existente, no se
+// crea otro: se fusiona y suma un toque. Un nivel tocado tres veces no son tres
+// niveles débiles, es un nivel fuerte — y tres grupos de stops apilados.
+addOrMerge(array<Pool> arr, float px, int side, int atBar, float volAdd, bool isStruct) =>
+    float tol = volUnit * clusterTol
+    Pool  hit = na
+    int   n   = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and math.abs(p.price - px) <= tol
+                hit := p
+                break
+    if na(hit)
+        array.push(arr, Pool.new(price = px, side = side, pmin = px, pmax = px,
+             volAcc = volAdd, bornBar = atBar, lastBar = atBar, structural = isStruct))
+    else
+        // El precio del cluster se pondera por toques: manda el consenso, no el
+        // último dato que llegó.
+        hit.price      := (hit.price * hit.touches + px) / (hit.touches + 1)
+        hit.touches    += 1
+        hit.pmin       := math.min(hit.pmin, px)
+        hit.pmax       := math.max(hit.pmax, px)
+        hit.volAcc     += volAdd
+        hit.lastBar    := atBar
+        hit.structural := hit.structural or isStruct
+
+//──────────────────────────── NIVELES ESTRUCTURALES ───────────────────────────
+// Máximo/mínimo del día y la semana previos. No son swings cualesquiera: son
+// los niveles que salen en cada informe y que cualquiera con una plataforma ve.
+// Idioma no repintable: valor ya cerrado ([1]) + lookahead_on.
+pdh = useStruct ? request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on) : na
+pdl = useStruct ? request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on) : na
+pwh = useStruct ? request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on) : na
+pwl = useStruct ? request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on) : na
+
+//───────────────────────── CONSTRUCCIÓN DEL MAPA ──────────────────────────────
+// Los swings se confirman con retardo: el extremo está `swingLen` barras atrás.
+if barstate.isconfirmed
+    if isSwingHigh(swingLen)
+        addOrMerge(poolsUp, high[swingLen],  1, bar_index - swingLen, volume[swingLen] * wickShare(swingLen), false)
+    if isSwingLow(swingLen)
+        addOrMerge(poolsDn, low[swingLen],  -1, bar_index - swingLen, volume[swingLen] * wickShare(swingLen), false)
+
+    if useStruct
+        if not na(pdh) and pdh != nz(pdh[1], -1.0)
+            addOrMerge(poolsUp, pdh,  1, bar_index, avgVol * 0.5, true)
+        if not na(pwh) and pwh != nz(pwh[1], -1.0)
+            addOrMerge(poolsUp, pwh,  1, bar_index, avgVol * 0.8, true)
+        if not na(pdl) and pdl != nz(pdl[1], -1.0)
+            addOrMerge(poolsDn, pdl, -1, bar_index, avgVol * 0.5, true)
+        if not na(pwl) and pwl != nz(pwl[1], -1.0)
+            addOrMerge(poolsDn, pwl, -1, bar_index, avgVol * 0.8, true)
+
+//─────────────────── DESENLACE: ¿BARRIDO O RUPTURA REAL? ──────────────────────
+// Esta distinción decide todo lo que venga después.
+//   BARRIDO → el precio perforó el nivel y volvió a cerrar dentro. La liquidez
+//             se cobró y el movimiento era mentira. Es la trampa.
+//   ROTURA  → el precio perforó y se quedó fuera. La liquidez se cobró pero el
+//             movimiento era real. Es continuación.
+// Confundir las dos es la forma más rápida de perder dinero con esta lógica.
+resolvePools(array<Pool> arr, int side) =>
+    int nSweep = 0
+    int nBreak = 0
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0
+                bool pierced = side == 1 ? high > p.price : low < p.price
+                if not p.raided and pierced
+                    p.raided  := true
+                    p.raidBar := bar_index
+                if p.raided
+                    bool backInside = side == 1 ? close < p.price : close > p.price
+                    if backInside
+                        p.outcome := 1
+                        p.outBar  := bar_index
+                        nSweep    += 1
+                    else if bar_index - p.raidBar >= reclaimBars
+                        p.outcome := 2
+                        p.outBar  := bar_index
+                        nBreak    += 1
+    [nSweep, nBreak]
+
+if barstate.isconfirmed
+    [su, bu] = resolvePools(poolsUp, 1)
+    [sd, bd] = resolvePools(poolsDn, -1)
+    sweepsUp += su
+    breaksUp += bu
+    sweepsDn += sd
+    breaksDn += bd
+
+//──────────────────────────── SCORING DE MAGNETISMO ───────────────────────────
+// Cinco preguntas, cada una respondida entre 0 y 1:
+//   ¿Cuánta gente dejó órdenes aquí?      → toques
+//   ¿Qué tan obvio es el nivel?           → igualdad del cluster
+//   ¿Cuánto capital quedó atrapado?       → volumen rechazado
+//   ¿Es un número que la gente recuerda?  → redondez
+//   ¿Está al alcance?                     → proximidad
+// Un pool ya consumido puntúa 0: su combustible se quemó.
+method rescore(Pool p) =>
+    if p.outcome != 0
+        p.score := 0.0
+    else
+        float sTouch = math.min(p.touches / 4.0, 1.0)
+        float spread = nz(p.pmax - p.pmin, 0.0)
+        float sTight = p.touches < 2 ? 0.35
+             : math.max(0.0, 1.0 - spread / math.max(volUnit * tightTol, 1e-8))
+        float sVol   = math.min(p.volAcc / math.max(avgVol * 1.5 * p.touches, 1e-8), 1.0)
+        float sRound = roundPull(p.price)
+        float sProx  = math.exp(-math.abs(p.price - close) / math.max(volUnit * proxDecay, 1e-8))
+        float wSum   = math.max(wTouch + wTight + wVol + wRound + wProx, 1e-8)
+        float raw    = wTouch * sTouch + wTight * sTight + wVol * sVol + wRound * sRound + wProx * sProx
+        // Los niveles estructurales cargan visibilidad extra: más ojos encima.
+        p.score := math.min(100.0 * raw / wSum * (p.structural ? 1.15 : 1.0), 100.0)
+
+//────────────────────── PODA: MANTENER EL MAPA LEGIBLE ────────────────────────
+// Se descarta lo que salió de la ventana de N días y lo que ya no compite. Los
+// consumidos se retienen un tiempo: son la evidencia de cómo se comporta este
+// activo, y el módulo 02 vive de esa evidencia.
+killPool(Pool p) =>
+    if not na(p.ln)
+        line.delete(p.ln)
+    if not na(p.lb)
+        label.delete(p.lb)
+
+prune(array<Pool> arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            Pool p = array.get(arr, i)
+            bool tooOld   = bar_index - p.bornBar > lookback
+            bool deadLong = p.outcome != 0 and bar_index - p.outBar > lookback / 4
+            if tooOld or deadLong
+                killPool(p)
+                array.remove(arr, i)
+
+    // Si sobran pools vivos, muere el de menor magnetismo.
+    int alive = 0
+    int m = array.size(arr)
+    if m > 0
+        for i = 0 to m - 1
+            if array.get(arr, i).outcome == 0
+                alive += 1
+
+    while alive > maxPools
+        int   worstI = -1
+        float worstS = 1e18
+        int   k = array.size(arr)
+        if k > 0
+            for i = 0 to k - 1
+                Pool p = array.get(arr, i)
+                if p.outcome == 0 and p.score < worstS
+                    worstS := p.score
+                    worstI := i
+        if worstI < 0
+            break
+        killPool(array.get(arr, worstI))
+        array.remove(arr, worstI)
+        alive -= 1
+
+if barstate.isconfirmed
+    int nu = array.size(poolsUp)
+    if nu > 0
+        for i = 0 to nu - 1
+            array.get(poolsUp, i).rescore()
+    int nd = array.size(poolsDn)
+    if nd > 0
+        for i = 0 to nd - 1
+            array.get(poolsDn, i).rescore()
+    prune(poolsUp)
+    prune(poolsDn)
+
+//──────────────────────────── RANGO OPERATIVO ─────────────────────────────────
+// Mitad superior = PREMIUM (zona cara: ahí se reparte, no se acumula).
+// Mitad inferior = DESCUENTO (zona barata: ahí se acumula).
+// Comprar en premium es pagar el precio del que llega tarde.
+float rngHi  = ta.highest(high, lookback)
+float rngLo  = ta.lowest(low,   lookback)
+float rngEq  = (rngHi + rngLo) / 2.0
+float rngPos = rngHi > rngLo ? (close - rngLo) / (rngHi - rngLo) * 100.0 : 50.0
+string zone  = rngPos >= 65 ? "PREMIUM" : rngPos <= 35 ? "DESCUENTO" : "EQUILIBRIO"
+
+//───────────────────────── SESGO DE IMÁN (salida clave) ───────────────────────
+// La suma de magnetismo de cada lado responde a la pregunta operativa real:
+// ¿dónde hay más comida? El precio tiende al lado con más combustible sin
+// cobrar. Esto NO es una señal de entrada: es el sesgo del entorno.
+sumScore(array<Pool> arr) =>
+    float s = 0.0
+    int   n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0
+                s += p.score
+    s
+
+// Mejor objetivo de cada lado: el pool que más tira.
+bestPool(array<Pool> arr) =>
+    float bp = na
+    float bs = -1.0
+    int   n  = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and p.score > bs
+                bs := p.score
+                bp := p.price
+    [bp, math.max(bs, 0.0)]
+
+float scoreUp = sumScore(poolsUp)
+float scoreDn = sumScore(poolsDn)
+float magnetBias = (scoreUp + scoreDn) > 0 ? (scoreUp - scoreDn) / (scoreUp + scoreDn) * 100.0 : 0.0
+
+[bestUpPx, bestUpSc] = bestPool(poolsUp)
+[bestDnPx, bestDnSc] = bestPool(poolsDn)
+
+// Series expuestas en la Data Window para consumo desde otros scripts y para
+// que el módulo 03 pueda usarlas como fuente externa de objetivos.
+plot(magnetBias, "Sesgo de imán",        display = display.data_window)
+plot(bestUpPx,   "Objetivo arriba",      display = display.data_window)
+plot(bestDnPx,   "Objetivo abajo",       display = display.data_window)
+plot(rngPos,     "Posición en rango %",  display = display.data_window)
+
+//──────────────────────────────── DIBUJO ──────────────────────────────────────
+drawArr(array<Pool> arr, color baseCol) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            bool visible = showPools and (p.outcome == 0 ? p.score >= minScoreDraw : showConsumed)
+            if not visible
+                killPool(p)
+                p.ln := na
+                p.lb := na
+                continue
+
+            // Grosor y opacidad hablan: cuanto más gordo y sólido, más imán.
+            int   w  = p.outcome != 0 ? 1 : p.score >= 75 ? 4 : p.score >= 55 ? 3 : p.score >= 35 ? 2 : 1
+            color c  = p.outcome != 0 ? colDead : color.new(baseCol, int(math.max(0, 70 - p.score * 0.6)))
+            int   x2 = p.outcome != 0 ? p.outBar : bar_index + 8
+
+            if na(p.ln)
+                p.ln := line.new(p.bornBar, p.price, x2, p.price, xloc = xloc.bar_index,
+                     color = c, width = w, style = p.structural ? line.style_solid : line.style_dashed)
+            else
+                line.set_xy1(p.ln, p.bornBar, p.price)
+                line.set_xy2(p.ln, x2, p.price)
+                line.set_color(p.ln, c)
+                line.set_width(p.ln, w)
+
+            if showLabels
+                string txt = (p.outcome == 1 ? "BARRIDO " : p.outcome == 2 ? "ROTO " : "") +
+                     str.tostring(p.price, format.mintick) +
+                     (p.outcome == 0 ? "  ·" + str.tostring(p.touches) + "x  ·" + str.tostring(p.score, "#") : "")
+                if na(p.lb)
+                    p.lb := label.new(x2, p.price, txt, xloc = xloc.bar_index,
+                         style = label.style_label_left, size = size.tiny,
+                         color = color.new(color.black, 100), textcolor = c)
+                else
+                    label.set_xy(p.lb, x2, p.price)
+                    label.set_text(p.lb, txt)
+                    label.set_textcolor(p.lb, c)
+            else if not na(p.lb)
+                label.delete(p.lb)
+                p.lb := na
+
+if barstate.islast
+    drawArr(poolsUp, colBuy)
+    drawArr(poolsDn, colSell)
+
+// Rango operativo
+var line lnHi = na
+var line lnLo = na
+var line lnEq = na
+if barstate.islast and showRange
+    int x1 = bar_index - lookback
+    int x2 = bar_index + 8
+    if na(lnHi)
+        lnHi := line.new(x1, rngHi, x2, rngHi, xloc = xloc.bar_index, color = color.new(color.gray, 40), width = 1)
+        lnLo := line.new(x1, rngLo, x2, rngLo, xloc = xloc.bar_index, color = color.new(color.gray, 40), width = 1)
+        lnEq := line.new(x1, rngEq, x2, rngEq, xloc = xloc.bar_index, color = color.new(color.orange, 45), width = 1, style = line.style_dotted)
+    else
+        line.set_xy1(lnHi, x1, rngHi)
+        line.set_xy2(lnHi, x2, rngHi)
+        line.set_xy1(lnLo, x1, rngLo)
+        line.set_xy2(lnLo, x2, rngLo)
+        line.set_xy1(lnEq, x1, rngEq)
+        line.set_xy2(lnEq, x2, rngEq)
+
+//──────────────────────────── PANEL DE LECTURA ────────────────────────────────
+var table pnl = table.new(position.top_right, 2, 9,
+     border_color = color.new(color.gray, 70), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+row(int r, string k, string v, color cv) =>
+    table.cell(pnl, 0, r, k, text_size = size.small, text_color = color.new(color.gray, 10),
+         text_halign = text.align_left,  bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 1, r, v, text_size = size.small, text_color = cv,
+         text_halign = text.align_right, bgcolor = color.new(color.black, 82))
+
+if barstate.islast and showTable
+    color cBias = magnetBias > 15 ? colBuy : magnetBias < -15 ? colSell : color.new(color.gray, 10)
+    color cZone = zone == "PREMIUM" ? colSell : zone == "DESCUENTO" ? colBuy : color.new(color.orange, 10)
+
+    table.cell(pnl, 0, 0, "MAPA DE LIQUIDEZ · " + str.tostring(lookbackDays) + "d",
+         text_size = size.small, text_color = color.white, text_halign = text.align_left,
+         bgcolor = color.new(color.blue, 55))
+    table.cell(pnl, 1, 0, syminfo.ticker + " " + timeframe.period,
+         text_size = size.small, text_color = color.white, text_halign = text.align_right,
+         bgcolor = color.new(color.blue, 55))
+
+    row(1, "Zona del rango",  zone + "  " + str.tostring(rngPos, "#") + "%", cZone)
+    row(2, "Equilibrio",      str.tostring(rngEq, format.mintick), color.new(color.orange, 10))
+    row(3, "Objetivo arriba", na(bestUpPx) ? "—" : str.tostring(bestUpPx, format.mintick) + "  (" + str.tostring(bestUpSc, "#") + ")", colBuy)
+    row(4, "Objetivo abajo",  na(bestDnPx) ? "—" : str.tostring(bestDnPx, format.mintick) + "  (" + str.tostring(bestDnSc, "#") + ")", colSell)
+    row(5, "Combustible ↑/↓", str.tostring(scoreUp, "#") + " / " + str.tostring(scoreDn, "#"), color.new(color.gray, 10))
+    row(6, "SESGO DE IMÁN",   (magnetBias > 0 ? "+" : "") + str.tostring(magnetBias, "#") +
+         (magnetBias > 15 ? "  ↑ arriba" : magnetBias < -15 ? "  ↓ abajo" : "  · neutro"), cBias)
+    row(7, "Barridos ↑/↓",    str.tostring(sweepsUp) + " / " + str.tostring(sweepsDn), color.new(color.gray, 10))
+    row(8, "Roturas ↑/↓",     str.tostring(breaksUp) + " / " + str.tostring(breaksDn), color.new(color.gray, 10))
+
+//──────────────────────────────── ALERTAS ─────────────────────────────────────
+// Un barrido recién confirmado es el evento que importa: la trampa acaba de
+// cerrarse y el desplazamiento suele venir detrás.
+justSweptUp = barstate.isconfirmed and sweepsUp > nz(sweepsUp[1], 0)
+justSweptDn = barstate.isconfirmed and sweepsDn > nz(sweepsDn[1], 0)
+
+alertcondition(justSweptUp, "Barrido buy-side",  "Liquidez barrida ARRIBA y precio recuperado dentro — sesgo bajista")
+alertcondition(justSweptDn, "Barrido sell-side", "Liquidez barrida ABAJO y precio recuperado dentro — sesgo alcista")
+
+plotshape(justSweptUp, "Barrido ↑", shape.triangledown, location.abovebar, colSell, size = size.tiny)
+plotshape(justSweptDn, "Barrido ↓", shape.triangleup,   location.belowbar, colBuy,  size = size.tiny)
