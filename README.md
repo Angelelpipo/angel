@@ -17,8 +17,8 @@ microestructura, y es medible.
 | 01 · Mapa de liquidez | `pine/01_liquidity_map.pine` | ✅ |
 | 02 · Índice de manipulabilidad | `pine/02_manipulability_index.pine` | ✅ |
 | 03 · Escalera (step trailing stop) | `pine/03_ladder_exit.pine` | ✅ |
-| 04 · Motor de señal (trampa + desplazamiento + entrada escalonada) | — | pendiente |
-| 05 · Ensamblaje y scoring 0-100 | — | pendiente |
+| 04 · Motor de señal | `pine/04_signal_engine.pine` | ✅ |
+| 05 · Estrategia ejecutable (04 + 03 con tamaño por score) | — | pendiente |
 
 Todo escrito desde primitivas: precio, volumen, tiempo, open interest y funding.
 Sin osciladores, sin medias como señal, sin plantillas ni scripts de terceros.
@@ -150,6 +150,61 @@ sí sola. El motor de señal real es el módulo 04.
 
 ---
 
+## Módulo 04 · Motor de señal
+
+Convierte el mapa en una operación concreta: máquina de estados de la trampa,
+filtro de régimen, scoring 0-100 y los tres tramos de entrada con sus precios.
+
+```
+IDLE ──sweep──► BARRIDO ──desplazamiento──► ARMADO ──retroceso──► GATILLO
+                   │                          │
+                   └──── invalidado ──────────┴──► MUERTO
+```
+
+**El filtro de régimen.** Se mide con la eficiencia del camino: distancia neta
+dividida entre camino recorrido, sin medias ni osciladores. Alta = el precio va
+a algún sitio (tendencia); baja = ir y venir (rango). La regla que aplica:
+
+- En **rango**, un barrido es reversión.
+- En **tendencia**, un barrido solo vale si resuelve **a favor** de la
+  corriente: el precio limpia stops contrarios y sigue. Un barrido que
+  resolvería contra la tendencia se bloquea.
+
+Sin esto la lógica fadea tendencias y sangra, por muy bonito que se vea el
+barrido.
+
+**Los tres tramos.** El T1 es la respuesta a "reaccionar puede ser muy tarde":
+es una orden límite descansando *dentro* del pool, colocada antes de que el
+precio llegue. No reacciona a la cascada de stops — es su contraparte. Si el
+pool nunca se barre, no se llena y no cuesta nada.
+
+| Tramo | Cuándo | Tamaño | Precio |
+|---|---|---|---|
+| T1 · Emboscada | Límite dentro del pool, antes del barrido | 25% | `pool ∓ profundidad × volatilidad` |
+| T2 · Confirmación | Tras el desplazamiento | 50% | Cierre de la barra de confirmación |
+| T3 · Retroceso | Al hueco de ineficiencia | 25% | Punto medio del FVG, o 0.618–0.79 de la pata |
+
+El riesgo asimétrico está en el **tamaño** de cada tramo, no en la certeza de
+ninguno.
+
+**Scoring del setup (0-100).** Magnetismo del pool barrido (25), alineación de
+régimen (20), calidad del desplazamiento (15), premium/descuento (15), recorrido
+hasta el objetivo (15) y sesión (10). Por debajo del mínimo configurado no se
+emite señal.
+
+**El R:R se mide sobre la entrada promedio ponderada**, no sobre T2. T2 es por
+construcción el peor precio de los tres; juzgar la operación por él descarta
+setups excelentes. Una simulación de control sobre una trampa sintética daba
+1.45 en T2 y 2.54 en T3 — el mismo setup, rechazado o aceptado según dónde se
+mire. El panel muestra los tres valores por separado.
+
+**Stop y objetivo.** El stop va detrás de la mecha del barrido: si esa mecha se
+pierde, la lectura entera estaba equivocada. El objetivo es el pool de más
+magnetismo del lado contrario que esté realmente por delante del precio — el
+sitio al que va a buscar la siguiente ración de liquidez.
+
+---
+
 ## Uso
 
 Cada archivo es un script independiente: copiar y pegar en el Pine Editor de
@@ -161,7 +216,10 @@ Orden recomendado:
    45, no hay materia prima y no hay estrategia que valga — cambia de símbolo.
 2. Abre el **01** sobre el activo elegido. Lee el sesgo de imán y la zona del
    rango antes de mirar nada más.
-3. El **03** se backtestea por separado para calibrar espaciado, número de
+3. El **04** es el que dice si hay operación y a qué precios. Empieza mirando el
+   régimen: si está en tendencia, la mitad de los barridos que verás están
+   bloqueados a propósito.
+4. El **03** se backtestea por separado para calibrar espaciado, número de
    peldaños y distancia de stop en ese activo.
 
 Desarrollo recomendado en BTCUSDT perp aunque no sea donde está el edge más
@@ -179,6 +237,8 @@ vez validado el motor, el escáner del módulo 02 dice a dónde llevarlo.
 - **Muestra.** 30 días es el mapa, no el sesgo. La dirección macro tiene que
   venir de temporalidad mayor; con un mes de datos se mapea liquidez, no se
   determina tendencia.
-- **Filtro de régimen (pendiente, módulo 04).** Un barrido en rango es
-  reversión; en tendencia fuerte es continuación — el precio limpia stops
-  contrarios y sigue. Sin ese filtro la lógica fadea tendencias y sangra.
+- **Retardo de una barra en el desplazamiento.** El hueco de ineficiencia se
+  mide sobre tres velas, así que no existe hasta que las tres han cerrado. Es un
+  retardo real y asumido: el T1 está precisamente para no depender de él.
+- **Un setup a la vez.** Un barrido nuevo con magnetismo suficiente reemplaza al
+  setup anterior. La trampa más reciente es la relevante.

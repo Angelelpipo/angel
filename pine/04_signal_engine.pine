@@ -1,0 +1,695 @@
+//@version=6
+//══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATOR ENGINE · MÓDULO 04 — MOTOR DE SEÑAL
+//══════════════════════════════════════════════════════════════════════════════
+//  Qué hace:
+//    Convierte el mapa de liquidez en una operación concreta. Ejecuta la
+//    máquina de estados de la trampa, filtra por régimen, puntúa el setup de
+//    0 a 100 y emite los tres tramos de entrada con sus precios.
+//
+//  La máquina de estados:
+//
+//    IDLE ──sweep──► BARRIDO ──desplazamiento──► ARMADO ──retroceso──► GATILLO
+//                       │                          │
+//                       └──── invalidado ──────────┴──► MUERTO
+//
+//  Los tres tramos, y por qué son tres:
+//
+//    T1 · EMBOSCADA   Orden límite DENTRO del pool, colocada ANTES de que el
+//                     precio llegue. Es lo que hace el dinero grande: no
+//                     reacciona a la cascada de stops, es su contraparte. Si el
+//                     pool nunca se barre, la orden no se llena y no cuesta
+//                     nada. Tamaño pequeño, stop diminuto.
+//
+//    T2 · CONFIRMACIÓN  Tras el desplazamiento. Ya sabemos que la trampa
+//                     funcionó. Tamaño grande.
+//
+//    T3 · RETROCESO   En el hueco de ineficiencia que dejó el desplazamiento.
+//                     El mejor precio de los tres, pero puede no llegar nunca.
+//
+//    Entrar solo en T2 es llegar tarde. Entrar solo en T1 es adivinar. El
+//    riesgo asimétrico está en el TAMAÑO de cada tramo, no en la certeza de
+//    ninguno.
+//
+//  El filtro de régimen no es opcional:
+//    En rango,    un barrido es REVERSIÓN.
+//    En tendencia, un barrido a favor es CONTINUACIÓN — el precio limpia stops
+//    contrarios y sigue. Sin esta distinción la lógica fadea tendencias y
+//    sangra, por muy bonito que se vea el barrido.
+//══════════════════════════════════════════════════════════════════════════════
+
+indicator("Manipulator Engine 04 · Motor de Señal", "ME·SIG", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+//──────────────────────────────────── ENTRADAS ────────────────────────────────
+var string GW = "1 · Ventana y mapa"
+lookbackDays = input.int(30,     "Días de historia",                       minval = 1, maxval = 365, group = GW)
+volLen       = input.int(48,     "Barras para la unidad de volatilidad",   minval = 5,               group = GW)
+swingLen     = input.int(5,      "Fuerza del swing",                       minval = 1, maxval = 50,  group = GW)
+clusterTol   = input.float(0.35, "Tolerancia de cluster (× volatilidad)",  minval = 0.01, step = 0.05, group = GW)
+tightTol     = input.float(0.80, "Umbral de máximos iguales (× volat.)",   minval = 0.05, step = 0.05, group = GW)
+maxPools     = input.int(10,     "Pools vivos por lado",                   minval = 2, maxval = 40,  group = GW)
+minPoolScore = input.float(45,   "Magnetismo mínimo del pool barrido",     minval = 0, maxval = 100, group = GW)
+
+var string GR = "2 · Régimen"
+effLen    = input.int(96,      "Barras para medir eficiencia del camino", minval = 20, group = GR)
+effThresh = input.float(0.30,  "Eficiencia que define tendencia", minval = 0.05, maxval = 0.9, step = 0.01, group = GR,
+     tooltip = "Distancia neta dividida entre camino recorrido. Alto = el precio va a algún sitio (tendencia). Bajo = ir y venir (rango).")
+counterMode = input.string("Bloquear", "Barridos contra la tendencia", options = ["Bloquear", "Penalizar"], group = GR,
+     tooltip = "En tendencia alcista, un barrido de máximos que resuelve a la baja es pelearse con la corriente. Bloquear es lo prudente.")
+
+var string GT = "3 · Trampa y desplazamiento"
+reclaimBars = input.int(3,      "Barras para confirmar la recuperación", minval = 1, group = GT)
+dispWindow  = input.int(6,      "Barras para que llegue el desplazamiento", minval = 1, group = GT)
+dispMult    = input.float(1.20, "Cuerpo mínimo del desplazamiento (× volat.)", minval = 0.3, step = 0.1, group = GT)
+requireFVG  = input.bool(true,  "Exigir hueco de ineficiencia (FVG)", group = GT,
+     tooltip = "El hueco entre la mecha de la primera vela y la de la tercera. Es la huella de que alguien movió precio sin esperar contraparte.")
+armWindow   = input.int(24,     "Barras de vida del setup armado", minval = 2, group = GT)
+stopPad     = input.float(0.25, "Colchón del stop tras la mecha (× volat.)", minval = 0, step = 0.05, group = GT)
+
+var string GA = "4 · Tramo 1 · Emboscada"
+ambushOn    = input.bool(true,   "Armar emboscadas", group = GA)
+ambushMin   = input.float(60,    "Magnetismo mínimo del pool", minval = 0, maxval = 100, group = GA)
+ambushDist  = input.float(3.0,   "Distancia máxima para armar (× volat.)", minval = 0.5, step = 0.5, group = GA)
+ambushDepth = input.float(0.35,  "Profundidad dentro del pool (× volat.)", minval = 0.05, step = 0.05, group = GA,
+     tooltip = "Cuánto más allá del nivel se deja la orden límite. El barrido siempre perfora un poco: ahí es donde se llena.")
+ambushStop  = input.float(1.00,  "Stop de la emboscada (× volat.)", minval = 0.1, step = 0.1, group = GA)
+
+var string GZ = "5 · Tamaño de los tramos (%)"
+szT1 = input.float(25, "T1 · Emboscada",    minval = 0, maxval = 100, group = GZ)
+szT2 = input.float(50, "T2 · Confirmación", minval = 0, maxval = 100, group = GZ)
+szT3 = input.float(25, "T3 · Retroceso",    minval = 0, maxval = 100, group = GZ)
+
+var string GS = "6 · Scoring del setup"
+wMagnet = input.float(25, "Peso · magnetismo del pool barrido", minval = 0, maxval = 100, group = GS)
+wRegime = input.float(20, "Peso · alineación de régimen",       minval = 0, maxval = 100, group = GS)
+wDisp   = input.float(15, "Peso · calidad del desplazamiento",  minval = 0, maxval = 100, group = GS)
+wPD     = input.float(15, "Peso · premium / descuento",         minval = 0, maxval = 100, group = GS)
+wRR     = input.float(15, "Peso · recorrido hasta el objetivo", minval = 0, maxval = 100, group = GS)
+wSess   = input.float(10, "Peso · sesión",                      minval = 0, maxval = 100, group = GS)
+minScore = input.float(60, "Score mínimo para emitir señal", minval = 0, maxval = 100, group = GS)
+rrFull   = input.float(3.0, "R:R que puntúa 100", minval = 0.5, step = 0.5, group = GS)
+rrMin    = input.float(1.5, "R:R mínimo aceptable", minval = 0.2, step = 0.1, group = GS)
+
+var string GH = "7 · Sesiones (UTC)"
+sessOn   = input.bool(true, "Ponderar por sesión", group = GH)
+lonStart = input.int(7,  "Londres · inicio", minval = 0, maxval = 23, group = GH)
+lonEnd   = input.int(10, "Londres · fin",    minval = 0, maxval = 24, group = GH)
+nyStart  = input.int(12, "Nueva York · inicio", minval = 0, maxval = 23, group = GH)
+nyEnd    = input.int(16, "Nueva York · fin",    minval = 0, maxval = 24, group = GH)
+wKill    = input.float(1.00, "Peso en killzone",   minval = 0, maxval = 1, step = 0.05, group = GH)
+wOff     = input.float(0.55, "Peso fuera de horas", minval = 0, maxval = 1, step = 0.05, group = GH)
+
+var string GV = "8 · Visual"
+showPools = input.bool(true, "Pools",            group = GV)
+showSetup = input.bool(true, "Setup activo",     group = GV)
+showTable = input.bool(true, "Panel de lectura", group = GV)
+colBuy    = input.color(color.new(#26a69a, 0), "Alcista", group = GV)
+colSell   = input.color(color.new(#ef5350, 0), "Bajista", group = GV)
+
+//──────────────────────── UNIDAD DE VOLATILIDAD (propia) ──────────────────────
+float trueRange = na(close[1]) ? high - low
+     : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+float volUnit = math.max(math.sum(trueRange, volLen) / volLen, syminfo.mintick)
+
+int   barSecs  = math.max(timeframe.in_seconds(timeframe.period), 1)
+int   lookback = math.min(math.max(int(lookbackDays * 86400 / barSecs), 20), 5000)
+float avgVol   = math.max(math.sum(volume, lookback) / lookback, 1e-8)
+
+roundStep(float px) =>
+    float d = math.floor(math.log10(math.max(math.abs(px), 1e-12)))
+    math.pow(10, d - 1)
+
+float stepMajor = roundStep(close)
+float stepMinor = stepMajor / 10.0
+
+roundPull(float px) =>
+    float dMaj = math.abs(px - math.round(px / stepMajor) * stepMajor) / math.max(stepMajor / 2.0, 1e-12)
+    float dMin = math.abs(px - math.round(px / stepMinor) * stepMinor) / math.max(stepMinor / 2.0, 1e-12)
+    math.max(1.0 - math.min(dMaj, 1.0), 0.5 * (1.0 - math.min(dMin, 1.0)))
+
+//══════════════════════════════════════════════════════════════════════════════
+//  MAPA DE LIQUIDEZ (versión compacta del módulo 01)
+//══════════════════════════════════════════════════════════════════════════════
+type Pool
+    float price
+    int   side
+    int   touches    = 1
+    float pmin       = na
+    float pmax       = na
+    float volAcc     = 0.0
+    int   bornBar    = 0
+    bool  structural = false
+    bool  raided     = false
+    int   raidBar    = 0
+    int   outcome    = 0        // 0 intacto | 1 barrido | 2 roto
+    int   outBar     = 0
+    float score      = 0.0
+    line  ln         = na
+
+var array<Pool> poolsUp = array.new<Pool>()
+var array<Pool> poolsDn = array.new<Pool>()
+
+isSwingHigh(int L) =>
+    bool ok = true
+    float p = high[L]
+    if na(p)
+        ok := false
+    else
+        for i = 0 to 2 * L
+            if i != L and high[i] > p
+                ok := false
+                break
+    ok
+
+isSwingLow(int L) =>
+    bool ok = true
+    float p = low[L]
+    if na(p)
+        ok := false
+    else
+        for i = 0 to 2 * L
+            if i != L and low[i] < p
+                ok := false
+                break
+    ok
+
+wickShare(int off) =>
+    float rng = high[off] - low[off]
+    rng <= 0 ? 0.0 :
+     ((high[off] - math.max(open[off], close[off])) + (math.min(open[off], close[off]) - low[off])) / rng
+
+addOrMerge(array<Pool> arr, float px, int side, int atBar, float volAdd, bool isStruct) =>
+    float tol = volUnit * clusterTol
+    Pool  hit = na
+    int   n   = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and math.abs(p.price - px) <= tol
+                hit := p
+                break
+    if na(hit)
+        array.push(arr, Pool.new(price = px, side = side, pmin = px, pmax = px,
+             volAcc = volAdd, bornBar = atBar, structural = isStruct))
+    else
+        hit.price      := (hit.price * hit.touches + px) / (hit.touches + 1)
+        hit.touches    += 1
+        hit.pmin       := math.min(hit.pmin, px)
+        hit.pmax       := math.max(hit.pmax, px)
+        hit.volAcc     += volAdd
+        hit.structural := hit.structural or isStruct
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on)
+
+if barstate.isconfirmed
+    if isSwingHigh(swingLen)
+        addOrMerge(poolsUp, high[swingLen],  1, bar_index - swingLen, volume[swingLen] * wickShare(swingLen), false)
+    if isSwingLow(swingLen)
+        addOrMerge(poolsDn, low[swingLen],  -1, bar_index - swingLen, volume[swingLen] * wickShare(swingLen), false)
+    if not na(pdh) and pdh != nz(pdh[1], -1.0)
+        addOrMerge(poolsUp, pdh,  1, bar_index, avgVol * 0.5, true)
+    if not na(pwh) and pwh != nz(pwh[1], -1.0)
+        addOrMerge(poolsUp, pwh,  1, bar_index, avgVol * 0.8, true)
+    if not na(pdl) and pdl != nz(pdl[1], -1.0)
+        addOrMerge(poolsDn, pdl, -1, bar_index, avgVol * 0.5, true)
+    if not na(pwl) and pwl != nz(pwl[1], -1.0)
+        addOrMerge(poolsDn, pwl, -1, bar_index, avgVol * 0.8, true)
+
+method rescore(Pool p) =>
+    if p.outcome != 0
+        p.score := 0.0
+    else
+        float sTouch = math.min(p.touches / 4.0, 1.0)
+        float spread = nz(p.pmax - p.pmin, 0.0)
+        float sTight = p.touches < 2 ? 0.35 : math.max(0.0, 1.0 - spread / math.max(volUnit * tightTol, 1e-8))
+        float sVol   = math.min(p.volAcc / math.max(avgVol * 1.5 * p.touches, 1e-8), 1.0)
+        float sRound = roundPull(p.price)
+        float sProx  = math.exp(-math.abs(p.price - close) / math.max(volUnit * 10.0, 1e-8))
+        float raw    = 25 * sTouch + 20 * sTight + 20 * sVol + 15 * sRound + 20 * sProx
+        p.score := math.min(raw * (p.structural ? 1.15 : 1.0), 100.0)
+
+//──────────── DESENLACE DE CADA POOL, CON MEMORIA DEL BARRIDO ─────────────────
+// Se guarda el barrido más reciente de cada lado: es el disparador de la
+// máquina de estados.
+var float lastSweepPx    = na   // nivel barrido
+var float lastSweepScore = 0.0  // magnetismo que tenía
+var float lastSweepExt   = na   // extremo de la mecha = invalidación
+var int   lastSweepBar   = -1
+var int   lastSweepSide  = 0    // +1 barrido arriba (→ setup bajista)
+
+resolvePools(array<Pool> arr, int side) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0
+                bool pierced = side == 1 ? high > p.price : low < p.price
+                if not p.raided and pierced
+                    p.raided  := true
+                    p.raidBar := bar_index
+                if p.raided
+                    bool backInside = side == 1 ? close < p.price : close > p.price
+                    if backInside
+                        p.outcome := 1
+                        p.outBar  := bar_index
+                        // Solo los pools con magnetismo suficiente arman setup:
+                        // barrer un nivel que no le importa a nadie no es una
+                        // trampa, es ruido.
+                        if p.score >= minPoolScore
+                            lastSweepPx    := p.price
+                            lastSweepScore := p.score
+                            lastSweepExt   := side == 1 ? high : low
+                            lastSweepBar   := bar_index
+                            lastSweepSide  := side
+                    else if bar_index - p.raidBar >= reclaimBars
+                        p.outcome := 2
+                        p.outBar  := bar_index
+
+prune(array<Pool> arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            Pool p = array.get(arr, i)
+            if bar_index - p.bornBar > lookback or (p.outcome != 0 and bar_index - p.outBar > lookback / 6)
+                if not na(p.ln)
+                    line.delete(p.ln)
+                array.remove(arr, i)
+    int alive = 0
+    int m = array.size(arr)
+    if m > 0
+        for i = 0 to m - 1
+            if array.get(arr, i).outcome == 0
+                alive += 1
+    while alive > maxPools
+        int   wi = -1
+        float ws = 1e18
+        int   k  = array.size(arr)
+        if k > 0
+            for i = 0 to k - 1
+                Pool p = array.get(arr, i)
+                if p.outcome == 0 and p.score < ws
+                    ws := p.score
+                    wi := i
+        if wi < 0
+            break
+        Pool w = array.get(arr, wi)
+        if not na(w.ln)
+            line.delete(w.ln)
+        array.remove(arr, wi)
+        alive -= 1
+
+if barstate.isconfirmed
+    int nu = array.size(poolsUp)
+    if nu > 0
+        for i = 0 to nu - 1
+            array.get(poolsUp, i).rescore()
+    int nd = array.size(poolsDn)
+    if nd > 0
+        for i = 0 to nd - 1
+            array.get(poolsDn, i).rescore()
+    resolvePools(poolsUp, 1)
+    resolvePools(poolsDn, -1)
+    prune(poolsUp)
+    prune(poolsDn)
+
+bestPool(array<Pool> arr) =>
+    float bp = na
+    float bs = -1.0
+    int   n  = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and p.score > bs
+                bs := p.score
+                bp := p.price
+    [bp, math.max(bs, 0.0)]
+
+[bestUpPx, bestUpSc] = bestPool(poolsUp)
+[bestDnPx, bestDnSc] = bestPool(poolsDn)
+
+// Objetivo de un trade: el pool de más magnetismo que esté REALMENTE por
+// delante del precio de entrada. Sin este filtro se podría apuntar a un nivel
+// que ya quedó atrás y el R:R saldría inventado.
+targetPool(array<Pool> arr, int d, float fromPx) =>
+    float bp = na
+    float bs = -1.0
+    int   n  = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            bool beyond = d > 0 ? p.price > fromPx : p.price < fromPx
+            if p.outcome == 0 and beyond and p.score > bs
+                bs := p.score
+                bp := p.price
+    bp
+
+// Pool más cercano por lado — el candidato a emboscada.
+nearestPool(array<Pool> arr, int side) =>
+    float bp = na
+    float bs = 0.0
+    float bd = 1e18
+    int   n  = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and p.score >= ambushMin
+                float d = side == 1 ? p.price - close : close - p.price
+                if d > 0 and d < bd
+                    bd := d
+                    bp := p.price
+                    bs := p.score
+    [bp, bs, bd]
+
+[nearUpPx, nearUpSc, nearUpD] = nearestPool(poolsUp, 1)
+[nearDnPx, nearDnSc, nearDnD] = nearestPool(poolsDn, -1)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  RÉGIMEN — la pieza que impide fadear tendencias
+//══════════════════════════════════════════════════════════════════════════════
+// Eficiencia del camino: distancia neta partido camino recorrido. Si el precio
+// anduvo mucho para avanzar poco, es un rango; si avanzó casi en línea recta,
+// es una tendencia. Sin medias, sin osciladores: pura geometría del recorrido.
+float netMove  = close - close[effLen]
+float pathMove = math.sum(math.abs(close - close[1]), effLen)
+float pathEff  = pathMove > 0 ? math.abs(netMove) / pathMove : 0.0
+int   regime   = pathEff >= effThresh ? (netMove > 0 ? 1 : -1) : 0
+string regTxt  = regime == 1 ? "TENDENCIA ↑" : regime == -1 ? "TENDENCIA ↓" : "RANGO"
+
+// Rango operativo y posición dentro de él.
+float rngHi  = ta.highest(high, lookback)
+float rngLo  = ta.lowest(low,   lookback)
+float rngPos = rngHi > rngLo ? (close - rngLo) / (rngHi - rngLo) * 100.0 : 50.0
+string zone  = rngPos >= 65 ? "PREMIUM" : rngPos <= 35 ? "DESCUENTO" : "EQUILIBRIO"
+
+// Peso de sesión: un barrido en la apertura de Londres no vale lo mismo que uno
+// a las tres de la madrugada de un sábado.
+int  hUTC     = hour(time, "UTC")
+bool inKill   = (hUTC >= lonStart and hUTC < lonEnd) or (hUTC >= nyStart and hUTC < nyEnd)
+float sessW   = not sessOn ? 1.0 : inKill ? wKill : wOff
+string sessTx = not sessOn ? "—" : inKill ? "KILLZONE" : "fuera de horas"
+
+//══════════════════════════════════════════════════════════════════════════════
+//  DESPLAZAMIENTO — la huella de que alguien movió precio en serio
+//══════════════════════════════════════════════════════════════════════════════
+// Se evalúa sobre tres barras: el hueco entre la mecha de la primera y la de la
+// tercera es la ineficiencia que dejó el movimiento. La barra del medio es la
+// del desplazamiento. Implica un retardo de una barra, y es honesto: sin las
+// tres barras cerradas el hueco no existe todavía.
+float bodyMid = math.abs(close[1] - open[1])
+bool  bigBody = bodyMid >= dispMult * volUnit
+bool  bullFVG = low > high[2]
+bool  bearFVG = high < low[2]
+bool  bullDisp = bigBody and close[1] > open[1] and (not requireFVG or bullFVG)
+bool  bearDisp = bigBody and close[1] < open[1] and (not requireFVG or bearFVG)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  MÁQUINA DE ESTADOS DEL SETUP
+//══════════════════════════════════════════════════════════════════════════════
+type Setup
+    int   dir       = 0      // +1 largo | -1 corto
+    int   state     = 0      // 1 barrido · 2 armado · 3 gatillo · 4 muerto
+    float poolPx    = na
+    float poolScore = 0.0
+    float invalid   = na     // extremo de la mecha del barrido
+    int   sweepBar  = 0
+    int   dispBar   = 0
+    float zTop      = na     // zona de retroceso (T3)
+    float zBot      = na
+    float t1        = na
+    float t2        = na
+    float t3        = na
+    float entryAvg  = na     // entrada promedio ponderada por el tamaño de cada tramo
+    float stop      = na
+    float target    = na
+    float rr        = 0.0    // R:R sobre la entrada promedio — el que decide
+    float rrT2      = 0.0
+    float rrT3      = 0.0
+    float score     = 0.0
+    bool  blocked   = false
+    box   bx        = na
+
+var Setup cur = na
+
+// Pine no permite el operador de historial sobre campos de un objeto
+// (`cur.state[1]` no existe), así que el estado de la barra anterior se guarda
+// a mano. Se actualiza al final del script, después de emitir las señales.
+var int prevState = 0
+
+// ─── Nace un setup: acaba de confirmarse un barrido con magnetismo ───
+// La dirección del setup es SIEMPRE contraria al barrido: si se cobraron los
+// stops de arriba, el destino está abajo.
+bool newSweep = barstate.isconfirmed and lastSweepBar == bar_index
+
+if newSweep
+    if not na(cur) and not na(cur.bx)
+        box.delete(cur.bx)
+    cur := Setup.new(dir = -lastSweepSide, state = 1, poolPx = lastSweepPx,
+         poolScore = lastSweepScore, invalid = lastSweepExt, sweepBar = bar_index)
+
+// ─── Vida del setup ───
+if not na(cur) and barstate.isconfirmed
+    // El setup nunca avanza en la misma barra en que nació: el desplazamiento
+    // se mide sobre tres barras y en la barra del barrido esas tres son
+    // ANTERIORES a la trampa. Confirmar con ellas sería leer el futuro al revés.
+    if cur.state == 1 and bar_index > cur.sweepBar
+        // Invalidación: el precio se fue definitivamente al otro lado de la
+        // mecha del barrido. No era una trampa, era una ruptura.
+        bool broke = cur.dir > 0 ? close < cur.invalid : close > cur.invalid
+        bool timeout = bar_index - cur.sweepBar > dispWindow
+        if broke or timeout
+            cur.state := 4
+        else
+            bool disp = cur.dir > 0 ? bullDisp : bearDisp
+            if disp
+                cur.state   := 2
+                cur.dispBar := bar_index
+
+                // Zona de retroceso: el hueco si existe, y si no el tramo
+                // 0.618-0.79 de la pata del desplazamiento.
+                if cur.dir > 0 and bullFVG
+                    cur.zBot := high[2]
+                    cur.zTop := low
+                else if cur.dir < 0 and bearFVG
+                    cur.zTop := low[2]
+                    cur.zBot := high
+                else
+                    float legLo = math.min(math.min(low, low[1]), low[2])
+                    float legHi = math.max(math.max(high, high[1]), high[2])
+                    float leg   = legHi - legLo
+                    cur.zBot := cur.dir > 0 ? legLo + leg * 0.21 : legLo + leg * 0.62
+                    cur.zTop := cur.dir > 0 ? legLo + leg * 0.38 : legLo + leg * 0.79
+
+                // Precios de los tres tramos.
+                cur.t1 := cur.poolPx - cur.dir * ambushDepth * volUnit
+                cur.t2 := close
+                cur.t3 := (cur.zTop + cur.zBot) / 2.0
+
+                // Stop común a T2 y T3: detrás de la mecha del barrido. Si esa
+                // mecha se pierde, la lectura entera estaba equivocada.
+                cur.stop := cur.invalid - cur.dir * stopPad * volUnit
+
+                // Objetivo: el mejor pool del lado contrario. No es un múltiplo
+                // arbitrario — es el sitio al que el precio está yendo a buscar
+                // la siguiente ración de liquidez.
+                cur.target := cur.dir > 0 ? targetPool(poolsUp, 1, close) : targetPool(poolsDn, -1, close)
+
+                // Entrada promedio ponderada por el tamaño de cada tramo. Medir
+                // el R:R solo sobre T2 sería juzgar la operación por su peor
+                // precio: T2 es, por construcción, el más caro de los tres. Un
+                // setup excelente en T3 se descartaría por culpa de T2.
+                float wT = math.max(szT1 + szT2 + szT3, 1e-8)
+                cur.entryAvg := (szT1 * cur.t1 + szT2 * cur.t2 + szT3 * cur.t3) / wT
+
+                float riskAvg = math.abs(cur.entryAvg - cur.stop)
+                float riskT2  = math.abs(cur.t2 - cur.stop)
+                float riskT3  = math.abs(cur.t3 - cur.stop)
+                bool  hasTgt  = not na(cur.target)
+                cur.rr   := (hasTgt and riskAvg > 0) ? math.abs(cur.target - cur.entryAvg) / riskAvg : 0.0
+                cur.rrT2 := (hasTgt and riskT2  > 0) ? math.abs(cur.target - cur.t2)       / riskT2  : 0.0
+                cur.rrT3 := (hasTgt and riskT3  > 0) ? math.abs(cur.target - cur.t3)       / riskT3  : 0.0
+
+                //──────────────── SCORING DEL SETUP (0-100) ────────────────
+                float sMagnet = cur.poolScore / 100.0
+                // Régimen: en rango el barrido revierte; en tendencia solo vale
+                // si resuelve A FAVOR de la corriente.
+                float sReg = regime == 0 ? 0.75 : regime == cur.dir ? 1.0 : 0.0
+                cur.blocked := regime != 0 and regime != cur.dir and counterMode == "Bloquear"
+                float sDisp = math.min(bodyMid / math.max(dispMult * volUnit, 1e-8) / 1.5, 1.0)
+                // Premium/descuento: comprar barato, vender caro. Un largo en
+                // premium es pagar el precio del que llega tarde.
+                float sPD   = cur.dir > 0 ? (100.0 - rngPos) / 100.0 : rngPos / 100.0
+                float sRR   = math.min(cur.rr / math.max(rrFull, 1e-8), 1.0)
+                float sSess = sessW
+
+                float wSum = math.max(wMagnet + wRegime + wDisp + wPD + wRR + wSess, 1e-8)
+                float raw  = wMagnet * sMagnet + wRegime * sReg + wDisp * sDisp +
+                     wPD * sPD + wRR * sRR + wSess * sSess
+                cur.score := math.min(100.0 * raw / wSum, 100.0)
+
+                if cur.blocked or cur.rr < rrMin
+                    cur.state := 4
+
+    else if cur.state == 2
+        bool broke   = cur.dir > 0 ? close < cur.invalid : close > cur.invalid
+        bool timeout = bar_index - cur.dispBar > armWindow
+        bool tapped  = low <= cur.zTop and high >= cur.zBot
+        if broke or timeout
+            cur.state := 4
+        else if tapped
+            cur.state := 3
+
+    else if cur.state == 3
+        bool broke = cur.dir > 0 ? close < cur.stop : close > cur.stop
+        bool done  = not na(cur.target) and (cur.dir > 0 ? high >= cur.target : low <= cur.target)
+        if broke or done
+            cur.state := 4
+
+//══════════════════════════════════════════════════════════════════════════════
+//  TRAMO 1 · EMBOSCADA — independiente de la máquina de estados
+//══════════════════════════════════════════════════════════════════════════════
+// No espera a nada: se arma cuando el precio se acerca a un pool con
+// magnetismo. Es una orden límite descansando donde va a llegar la cascada.
+// Si el barrido no ocurre, no se llena y no cuesta nada.
+bool  ambUpArmed = ambushOn and not na(nearUpPx) and nearUpD <= ambushDist * volUnit
+bool  ambDnArmed = ambushOn and not na(nearDnPx) and nearDnD <= ambushDist * volUnit
+float ambUpPx    = ambUpArmed ? nearUpPx + ambushDepth * volUnit : na   // límite de VENTA
+float ambDnPx    = ambDnArmed ? nearDnPx - ambushDepth * volUnit : na   // límite de COMPRA
+float ambUpStop  = ambUpArmed ? ambUpPx + ambushStop * volUnit : na
+float ambDnStop  = ambDnArmed ? ambDnPx - ambushStop * volUnit : na
+
+//══════════════════════════════════════════════════════════════════════════════
+//  SEÑALES
+//══════════════════════════════════════════════════════════════════════════════
+bool sigT2 = not na(cur) and cur.state == 2 and prevState != 2 and cur.score >= minScore
+bool sigT3 = not na(cur) and cur.state == 3 and prevState != 3 and cur.score >= minScore
+int  sigDir = na(cur) ? 0 : cur.dir
+
+plotshape(sigT2 and sigDir > 0, "T2 largo",  shape.labelup,   location.belowbar, colBuy,  text = "T2", textcolor = color.white, size = size.small)
+plotshape(sigT2 and sigDir < 0, "T2 corto",  shape.labeldown, location.abovebar, colSell, text = "T2", textcolor = color.white, size = size.small)
+plotshape(sigT3 and sigDir > 0, "T3 largo",  shape.triangleup,   location.belowbar, colBuy,  size = size.tiny)
+plotshape(sigT3 and sigDir < 0, "T3 corto",  shape.triangledown, location.abovebar, colSell, size = size.tiny)
+
+// Series para que el módulo 05 las consuma como fuente externa.
+plot(na(cur) ? na : cur.score,  "Score del setup", display = display.data_window)
+plot(sigDir,                    "Dirección",       display = display.data_window)
+plot(na(cur) ? na : cur.t2,     "T2 precio",       display = display.data_window)
+plot(na(cur) ? na : cur.t3,     "T3 precio",       display = display.data_window)
+plot(na(cur) ? na : cur.entryAvg, "Entrada media", display = display.data_window)
+plot(na(cur) ? na : cur.stop,   "Stop",            display = display.data_window)
+plot(na(cur) ? na : cur.target, "Objetivo",        display = display.data_window)
+plot(ambUpPx,                   "T1 venta",        display = display.data_window)
+plot(ambDnPx,                   "T1 compra",       display = display.data_window)
+
+alertcondition(sigT2, "T2 · Confirmación", "Trampa confirmada con desplazamiento — entrada de confirmación")
+alertcondition(sigT3, "T3 · Retroceso",    "Precio en la zona de retroceso — entrada al mejor precio")
+alertcondition(ambushOn and (ambUpArmed and not ambUpArmed[1]), "T1 · Emboscada arriba", "Colocar límite de VENTA dentro del pool superior")
+alertcondition(ambushOn and (ambDnArmed and not ambDnArmed[1]), "T1 · Emboscada abajo",  "Colocar límite de COMPRA dentro del pool inferior")
+
+//══════════════════════════════════════════════════════════════════════════════
+//  VISUALIZACIÓN
+//══════════════════════════════════════════════════════════════════════════════
+if barstate.islast and showPools
+    int nu = array.size(poolsUp)
+    if nu > 0
+        for i = 0 to nu - 1
+            Pool p = array.get(poolsUp, i)
+            color c = p.outcome != 0 ? color.new(color.gray, 75) : color.new(colSell, int(math.max(0, 75 - p.score * 0.6)))
+            if na(p.ln)
+                p.ln := line.new(p.bornBar, p.price, bar_index + 6, p.price, xloc = xloc.bar_index, color = c, width = p.score >= 60 ? 2 : 1, style = line.style_dashed)
+            else
+                line.set_xy1(p.ln, p.bornBar, p.price)
+                line.set_xy2(p.ln, p.outcome != 0 ? p.outBar : bar_index + 6, p.price)
+                line.set_color(p.ln, c)
+    int nd = array.size(poolsDn)
+    if nd > 0
+        for i = 0 to nd - 1
+            Pool p = array.get(poolsDn, i)
+            color c = p.outcome != 0 ? color.new(color.gray, 75) : color.new(colBuy, int(math.max(0, 75 - p.score * 0.6)))
+            if na(p.ln)
+                p.ln := line.new(p.bornBar, p.price, bar_index + 6, p.price, xloc = xloc.bar_index, color = c, width = p.score >= 60 ? 2 : 1, style = line.style_dashed)
+            else
+                line.set_xy1(p.ln, p.bornBar, p.price)
+                line.set_xy2(p.ln, p.outcome != 0 ? p.outBar : bar_index + 6, p.price)
+                line.set_color(p.ln, c)
+
+// Zona de retroceso del setup vivo.
+if barstate.islast and showSetup
+    if not na(cur) and not na(cur.bx)
+        box.delete(cur.bx)
+    if not na(cur) and (cur.state == 2 or cur.state == 3) and not na(cur.zTop)
+        color cz = cur.dir > 0 ? colBuy : colSell
+        cur.bx := box.new(cur.dispBar, cur.zTop, bar_index + 10, cur.zBot,
+             xloc = xloc.bar_index, border_color = color.new(cz, 40),
+             bgcolor = color.new(cz, 88))
+
+var line lnStop = na
+var line lnTgt  = na
+var line lnT1a  = na
+var line lnT1b  = na
+
+setLine(line l, float px, color c, int st) =>
+    line ll = l
+    if na(px)
+        if not na(ll)
+            line.delete(ll)
+            ll := na
+    else if na(ll)
+        ll := line.new(bar_index - 30, px, bar_index + 10, px, xloc = xloc.bar_index, color = c, width = 1, style = st)
+    else
+        line.set_xy1(ll, bar_index - 30, px)
+        line.set_xy2(ll, bar_index + 10, px)
+        line.set_color(ll, c)
+    ll
+
+if barstate.islast and showSetup
+    bool live = not na(cur) and (cur.state == 2 or cur.state == 3)
+    lnStop := setLine(lnStop, live ? cur.stop   : na, colSell, line.style_solid)
+    lnTgt  := setLine(lnTgt,  live ? cur.target : na, colBuy,  line.style_solid)
+    lnT1a  := setLine(lnT1a,  ambUpPx, color.new(colSell, 35), line.style_dotted)
+    lnT1b  := setLine(lnT1b,  ambDnPx, color.new(colBuy,  35), line.style_dotted)
+
+//──────────────────────────── PANEL DE LECTURA ────────────────────────────────
+var table pnl = table.new(position.top_right, 2, 13,
+     border_color = color.new(color.gray, 70), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+row(int r, string k, string v, color cv) =>
+    table.cell(pnl, 0, r, k, text_size = size.small, text_color = color.new(color.gray, 10), text_halign = text.align_left,  bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 1, r, v, text_size = size.small, text_color = cv,                        text_halign = text.align_right, bgcolor = color.new(color.black, 82))
+
+if barstate.islast and showTable
+    bool   live  = not na(cur) and cur.state != 0 and cur.state != 4
+    string stTxt = na(cur) ? "sin setup"
+         : cur.state == 1 ? "BARRIDO · esperando desplazamiento"
+         : cur.state == 2 ? "ARMADO · esperando retroceso"
+         : cur.state == 3 ? "GATILLO"
+         : "muerto"
+    color  cDir = na(cur) or cur.dir == 0 ? color.new(color.gray, 10) : cur.dir > 0 ? colBuy : colSell
+    color  cSc  = na(cur) ? color.new(color.gray, 30) : cur.score >= minScore ? colBuy : color.new(color.orange, 10)
+
+    table.cell(pnl, 0, 0, "MOTOR DE SEÑAL", text_size = size.small, text_color = color.white, text_halign = text.align_left,  bgcolor = color.new(color.blue, 55))
+    table.cell(pnl, 1, 0, syminfo.ticker + " " + timeframe.period, text_size = size.small, text_color = color.white, text_halign = text.align_right, bgcolor = color.new(color.blue, 55))
+
+    row(1,  "Régimen",   regTxt + "  (ef " + str.tostring(pathEff, "#.##") + ")", regime == 0 ? color.new(color.orange, 10) : regime > 0 ? colBuy : colSell)
+    row(2,  "Zona",      zone + "  " + str.tostring(rngPos, "#") + "%", zone == "PREMIUM" ? colSell : zone == "DESCUENTO" ? colBuy : color.new(color.orange, 10))
+    row(3,  "Sesión",    sessTx, inKill ? colBuy : color.new(color.gray, 30))
+    row(4,  "Estado",    stTxt, live ? cDir : color.new(color.gray, 40))
+    row(5,  "Dirección", na(cur) or cur.dir == 0 ? "—" : (cur.dir > 0 ? "LARGO" : "CORTO"), cDir)
+    row(6,  "SCORE",     na(cur) ? "—" : str.tostring(cur.score, "#") + " / 100" + (na(cur) ? "" : cur.blocked ? "  ✗ régimen" : ""), cSc)
+    row(7,  "R:R medio",  na(cur) or cur.rr == 0 ? "—" : str.tostring(cur.rr, "#.#") + " : 1", na(cur) or cur.rr < rrMin ? color.new(color.orange, 10) : colBuy)
+    row(8,  "R:R T2 / T3", na(cur) or cur.rr == 0 ? "—" : str.tostring(cur.rrT2, "#.#") + " / " + str.tostring(cur.rrT3, "#.#"), color.new(color.gray, 10))
+    row(9,  "T1 límite",  not na(ambUpPx) ? "venta " + str.tostring(ambUpPx, format.mintick) : not na(ambDnPx) ? "compra " + str.tostring(ambDnPx, format.mintick) : "—", color.new(color.yellow, 20))
+    row(10, "T2 / T3",    live ? str.tostring(cur.t2, format.mintick) + " / " + str.tostring(cur.t3, format.mintick) : "—", color.new(color.gray, 10))
+    row(11, "Stop",      live ? str.tostring(cur.stop, format.mintick) : "—", colSell)
+    row(12, "Objetivo",  live and not na(cur.target) ? str.tostring(cur.target, format.mintick) : "—", colBuy)
+
+//──────────────────────── CIERRE DE BARRA ─────────────────────────────────────
+// Última línea a propósito: memoriza el estado para que la barra siguiente
+// pueda detectar la transición. Si esto subiera, las señales se emitirían dos
+// veces o ninguna.
+if barstate.isconfirmed
+    prevState := na(cur) ? 0 : cur.state
