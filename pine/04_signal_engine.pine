@@ -189,7 +189,11 @@ addOrMerge(array<Pool> arr, float px, int side, int atBar, float volAdd, bool is
             if p.outcome == 0 and math.abs(p.price - px) <= tol
                 hit := p
                 break
-    if na(hit)
+    // El valor de retorno se declara antes del if y se devuelve después. Si el
+    // if/else fuera la última expresión de la función, Pine intentaría unificar
+    // el tipo de las dos ramas — void en una, bool en la otra — y no compila.
+    bool isNew = na(hit)
+    if isNew
         array.push(arr, Pool.new(price = px, side = side, pmin = px, pmax = px,
              volAcc = volAdd, bornBar = atBar, structural = isStruct))
     else
@@ -199,6 +203,7 @@ addOrMerge(array<Pool> arr, float px, int side, int atBar, float volAdd, bool is
         hit.pmax       := math.max(hit.pmax, px)
         hit.volAcc     += volAdd
         hit.structural := hit.structural or isStruct
+    isNew
 
 pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
 pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
