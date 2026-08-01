@@ -18,7 +18,13 @@ microestructura, y es medible.
 | 02 · Índice de manipulabilidad | `pine/02_manipulability_index.pine` | ✅ |
 | 03 · Escalera (step trailing stop) | `pine/03_ladder_exit.pine` | ✅ |
 | 04 · Motor de señal | `pine/04_signal_engine.pine` | ✅ |
-| 05 · Estrategia ejecutable (04 + 03 con tamaño por score) | — | pendiente |
+| **05 · Estrategia completa** | **`pine/05_manipulator_strategy.pine`** | ✅ |
+
+**El 05 es el script único y el que se opera.** Contiene todo el sistema y no
+depende de los demás. Los módulos 01 a 04 son herramientas de diagnóstico: en
+TradingView cada script es una isla — no comparten datos ni estado — así que
+sirven para ver y calibrar cada pieza por separado, no para operar. Se pueden
+borrar sin perder nada.
 
 Todo escrito desde primitivas: precio, volumen, tiempo, open interest y funding.
 Sin osciladores, sin medias como señal, sin plantillas ni scripts de terceros.
@@ -205,12 +211,70 @@ sitio al que va a buscar la siguiente ración de liquidez.
 
 ---
 
+## Módulo 05 · Estrategia completa
+
+El sistema entero en un solo `strategy()`: mapa de liquidez, filtro de
+manipulabilidad, filtro de régimen, máquina de la trampa, entrada en tres tramos
+y escalera de salida.
+
+**Tamaño por score.** No hay señales binarias. Por debajo del score mínimo no se
+opera; en el score completo se arriesga el porcentaje configurado del capital;
+en medio, una rampa lineal. El riesgo se fija en dinero y se convierte a
+unidades dividiendo por la distancia al stop, así que **un stop más lejano da
+menos tamaño, nunca más riesgo**.
+
+**Dos anclas distintas, y no hay que confundirlas.** Fue el error de diseño más
+serio de este módulo y merece quedar escrito:
+
+- La **protección** (`ladBase`) es el stop de la emboscada, fijado en el precio
+  de la primera entrada y nunca ensanchado. Que el setup confirme después no es
+  motivo para arriesgar más de lo ya comprometido.
+- La **unidad de los objetivos** (`ladR`) es el riesgo *estructural*: entrada
+  media hasta el stop del setup, detrás de la mecha del barrido.
+
+Medir los peldaños con el stop de la emboscada — que es diminuto a propósito —
+los dejaba pegados a la entrada, y el trade se cerraba en el último peldaño sin
+haberse acercado al depósito de liquidez al que iba. Con las dos anclas
+separadas, una simulación de control sobre tres tramos da:
+
+```
+solo T1     avg  98.000  base 97.000  1R 1.00  TPs [ 99.0, 100.0, 101.0, 102.0]
+T1+T2       avg  99.299  base 97.000  1R 2.35  TPs [101.7, 104.0, 106.4, 108.7]
+T1+T2+T3    avg  99.598  base 97.000  1R 2.65  TPs [102.2, 104.9, 107.5, 110.2]
+
+peldaño 0   piso  97.000   bloqueado -0.98 R
+peldaño 1   piso  99.598   bloqueado +0.00 R   ← entrada media exacta
+peldaño 2   piso 102.246   bloqueado +1.00 R
+peldaño 3   piso 104.894   bloqueado +2.00 R
+
+riesgo comprometido 0.74% del capital (tope configurado 1.00%)
+```
+
+**Resincronización mientras `rung == 0`.** Los tramos llenan en momentos
+distintos, así que la escalera se rehace sobre la posición real hasta que se
+conquista el primer peldaño. A partir de ahí se congela: los peldaños pasan a
+ser compromisos adquiridos y moverlos rompería la promesa del piso. Y por si
+alguna rama de la lógica fallara, el piso pasa por un candado explícito que le
+impide bajar nunca.
+
+**Órdenes.** Seis identificadores de entrada (`T1L/T1S`, `T2L/T2S`, `T3L/T3S`)
+con sus seis salidas correspondientes, todas compartiendo el mismo piso y el
+mismo último peldaño, de forma que el conjunto se comporta como una sola
+posición. La emboscada solo se emite con la posición plana y T2/T3 se emiten una
+única vez, en la barra en que el setup se arma: recolocar una orden ya llenada
+con el mismo identificador duplicaría la posición.
+
+---
+
 ## Uso
 
 Cada archivo es un script independiente: copiar y pegar en el Pine Editor de
 TradingView. No hay dependencias entre scripts ni librerías que publicar.
 
-Orden recomendado:
+**Para operar basta con el 05.** Pégalo, guárdalo y añádelo al gráfico; se abre
+la pestaña de backtest abajo.
+
+Los demás son diagnóstico opcional, en este orden:
 
 1. Abre el **02** primero y mira el escáner. Si el activo puntúa por debajo de
    45, no hay materia prima y no hay estrategia que valga — cambia de símbolo.

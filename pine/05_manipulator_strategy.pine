@@ -1,0 +1,1028 @@
+//@version=6
+//══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATOR ENGINE · ESTRATEGIA COMPLETA
+//══════════════════════════════════════════════════════════════════════════════
+//  Este es el script único. Contiene todo el sistema y opera:
+//
+//    · Mapa de liquidez        — dónde están los stops y cuánto pesan
+//    · Filtro de manipulabilidad — si este activo tiende trampas o no
+//    · Filtro de régimen       — si el barrido es reversión o continuación
+//    · Máquina de la trampa    — barrido → desplazamiento → retroceso
+//    · Entrada en tres tramos  — emboscada, confirmación, retroceso
+//    · Escalera                — el piso del trade solo sube, nunca baja
+//
+//  La premisa: no predecimos hacia dónde irá el precio. Mapeamos hacia dónde lo
+//  llevaría alguien que necesita liquidez para llenar tamaño. Un stop es una
+//  orden de mercado dormida; un grupo de stops es un depósito; y las órdenes
+//  grandes solo se llenan donde hay contraparte. El precio viaja hacia donde
+//  está esa contraparte.
+//
+//  Todo escrito desde primitivas: precio, volumen, tiempo, open interest y
+//  funding. Sin osciladores, sin medias como señal, sin plantillas.
+//══════════════════════════════════════════════════════════════════════════════
+
+strategy("Manipulator Engine · Estrategia", "MANIPULATOR", overlay = true,
+     initial_capital       = 10000,
+     default_qty_type      = strategy.fixed,
+     default_qty_value     = 1,
+     pyramiding            = 3,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.05,
+     slippage              = 2,
+     calc_on_every_tick    = false,
+     max_lines_count       = 500,
+     max_labels_count      = 500,
+     max_boxes_count       = 500)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  ENTRADAS
+//══════════════════════════════════════════════════════════════════════════════
+var string G1 = "1 · Ventana y mapa de liquidez"
+lookbackDays = input.int(30,     "Días de historia",                      minval = 1, maxval = 365,   group = G1)
+volLen       = input.int(48,     "Barras para la unidad de volatilidad",  minval = 5,                 group = G1)
+swingLen     = input.int(5,      "Fuerza del swing",                      minval = 1, maxval = 50,    group = G1)
+clusterTol   = input.float(0.35, "Tolerancia de cluster (× volatilidad)", minval = 0.01, step = 0.05, group = G1)
+tightTol     = input.float(0.80, "Umbral de máximos iguales (× volat.)",  minval = 0.05, step = 0.05, group = G1)
+maxPools     = input.int(10,     "Pools vivos por lado",                  minval = 2, maxval = 40,    group = G1)
+minPoolScore = input.float(45,   "Magnetismo mínimo para armar setup",    minval = 0, maxval = 100,   group = G1)
+useStruct    = input.bool(true,  "Incluir niveles del día y la semana previos",                       group = G1)
+
+var string G2 = "2 · Filtro de manipulabilidad"
+manipOn   = input.bool(true,  "Exigir que el activo tienda trampas", group = G2,
+     tooltip = "Si el activo no perfora extremos obvios para cerrar de vuelta, no hay materia prima. Este filtro apaga la estrategia en mercados donde el patrón no vive.")
+manipMin  = input.float(45,  "Índice mínimo de manipulabilidad", minval = 0, maxval = 100, group = G2)
+swN       = input.int(20,    "Barras que definen un extremo obvio", minval = 3, group = G2)
+oiInput   = input.string("",  "Ticker de Open Interest (vacío = automático)", group = G2,
+     tooltip = "Automático prueba <símbolo>_OI. Si no resuelve, su peso se reparte entre el resto de componentes; el panel indica si el feed está vivo.")
+
+var string G3 = "3 · Régimen"
+effLen      = input.int(96,     "Barras para medir eficiencia del camino", minval = 20, group = G3)
+effThresh   = input.float(0.30, "Eficiencia que define tendencia", minval = 0.05, maxval = 0.9, step = 0.01, group = G3)
+counterMode = input.string("Bloquear", "Barridos contra la tendencia", options = ["Bloquear", "Penalizar"], group = G3,
+     tooltip = "En tendencia alcista, un barrido de máximos que resolvería a la baja es pelearse con la corriente. Bloquear es lo prudente.")
+
+var string G4 = "4 · Trampa y desplazamiento"
+reclaimBars = input.int(3,      "Barras para confirmar la recuperación",       minval = 1, group = G4)
+dispWindow  = input.int(6,      "Barras para que llegue el desplazamiento",    minval = 1, group = G4)
+dispMult    = input.float(1.20, "Cuerpo mínimo del desplazamiento (× volat.)", minval = 0.3, step = 0.1, group = G4)
+requireFVG  = input.bool(true,  "Exigir hueco de ineficiencia (FVG)", group = G4)
+armWindow   = input.int(24,     "Barras de vida del setup armado", minval = 2, group = G4)
+stopPad     = input.float(0.25, "Colchón del stop tras la mecha (× volat.)", minval = 0, step = 0.05, group = G4)
+
+var string G5 = "5 · Tramos de entrada"
+useT1  = input.bool(true, "T1 · Emboscada (límite dentro del pool)", group = G5,
+     tooltip = "Orden límite colocada ANTES de que llegue el precio. No reacciona a la cascada de stops: es su contraparte. Si el barrido no ocurre, no se llena y no cuesta nada.")
+useT2  = input.bool(true, "T2 · Confirmación (tras el desplazamiento)", group = G5)
+useT3  = input.bool(true, "T3 · Retroceso (al hueco de ineficiencia)",  group = G5)
+szT1   = input.float(25, "Reparto T1 (%)", minval = 0, maxval = 100, group = G5)
+szT2   = input.float(50, "Reparto T2 (%)", minval = 0, maxval = 100, group = G5)
+szT3   = input.float(25, "Reparto T3 (%)", minval = 0, maxval = 100, group = G5)
+ambushMin   = input.float(60,   "T1 · Magnetismo mínimo del pool", minval = 0, maxval = 100, group = G5)
+ambushDist  = input.float(3.0,  "T1 · Distancia máxima para armar (× volat.)", minval = 0.5, step = 0.5, group = G5)
+ambushDepth = input.float(0.35, "T1 · Profundidad dentro del pool (× volat.)", minval = 0.05, step = 0.05, group = G5)
+ambushStop  = input.float(1.00, "T1 · Stop (× volat.)", minval = 0.1, step = 0.1, group = G5)
+
+var string G6 = "6 · Riesgo y tamaño"
+riskPct   = input.float(1.0, "Riesgo por operación a tamaño completo (% del capital)", minval = 0.05, step = 0.05, group = G6)
+fullScore = input.float(80,  "Score que da tamaño completo", minval = 1, maxval = 100, group = G6)
+minMult   = input.float(0.40,"Fracción de tamaño en el score mínimo", minval = 0.05, maxval = 1, step = 0.05, group = G6)
+allowL    = input.bool(true, "Permitir largos", group = G6)
+allowS    = input.bool(true, "Permitir cortos", group = G6)
+
+var string G7 = "7 · Scoring del setup"
+wMagnet  = input.float(25, "Peso · magnetismo del pool barrido", minval = 0, maxval = 100, group = G7)
+wRegime  = input.float(20, "Peso · alineación de régimen",       minval = 0, maxval = 100, group = G7)
+wDisp    = input.float(15, "Peso · calidad del desplazamiento",  minval = 0, maxval = 100, group = G7)
+wPD      = input.float(15, "Peso · premium / descuento",         minval = 0, maxval = 100, group = G7)
+wRR      = input.float(15, "Peso · recorrido hasta el objetivo", minval = 0, maxval = 100, group = G7)
+wSess    = input.float(10, "Peso · sesión",                      minval = 0, maxval = 100, group = G7)
+minScore = input.float(60, "Score mínimo para operar", minval = 0, maxval = 100, group = G7)
+rrFull   = input.float(3.0, "R:R que puntúa 100",   minval = 0.5, step = 0.5, group = G7)
+rrMin    = input.float(1.5, "R:R mínimo aceptable", minval = 0.2, step = 0.1, group = G7)
+
+var string G8 = "8 · Escalera de salida"
+tpMode  = input.string("Múltiplos de R", "Cómo se colocan los peldaños",
+     options = ["Múltiplos de R", "Pools de liquidez"], group = G8,
+     tooltip = "Pools de liquidez coloca cada peldaño en el siguiente depósito de stops: el objetivo deja de ser un número bonito y pasa a ser el sitio al que el precio va a buscar la siguiente ración.")
+nRungs  = input.int(4, "Número de peldaños", minval = 2, maxval = 6, group = G8)
+rStep   = input.float(1.0, "Espaciado en R", minval = 0.1, step = 0.1, group = G8)
+minGap  = input.float(0.5, "Separación mínima entre peldaños (× R)", minval = 0.1, step = 0.1, group = G8)
+exitFin = input.bool(true, "Cerrar en el último peldaño", group = G8)
+partPct = input.float(0.0, "Cerrar % de la posición en cada peldaño", minval = 0, maxval = 90, step = 5, group = G8)
+consInt = input.bool(true, "Modo intrabarra conservador", group = G8,
+     tooltip = "Un peldaño conquistado solo eleva el piso a partir de la barra siguiente. Pine no sabe si dentro de una barra ocurrió antes el máximo o el mínimo; esto asume siempre lo peor. Desactivarlo infla el backtest.")
+
+var string G9 = "9 · Sesiones (UTC)"
+sessOn   = input.bool(true, "Ponderar por sesión", group = G9)
+lonStart = input.int(7,  "Londres · inicio",    minval = 0, maxval = 23, group = G9)
+lonEnd   = input.int(10, "Londres · fin",       minval = 0, maxval = 24, group = G9)
+nyStart  = input.int(12, "Nueva York · inicio", minval = 0, maxval = 23, group = G9)
+nyEnd    = input.int(16, "Nueva York · fin",    minval = 0, maxval = 24, group = G9)
+wKill    = input.float(1.00, "Peso en killzone",    minval = 0, maxval = 1, step = 0.05, group = G9)
+wOff     = input.float(0.55, "Peso fuera de horas", minval = 0, maxval = 1, step = 0.05, group = G9)
+
+var string GV = "10 · Visual"
+showPools = input.bool(true, "Pools de liquidez", group = GV)
+showSetup = input.bool(true, "Setup y escalera",  group = GV)
+showTable = input.bool(true, "Panel",             group = GV)
+colBuy    = input.color(color.new(#26a69a, 0), "Alcista", group = GV)
+colSell   = input.color(color.new(#ef5350, 0), "Bajista", group = GV)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  PRIMITIVAS
+//══════════════════════════════════════════════════════════════════════════════
+// Unidad de volatilidad propia: el metro con el que medimos todo, para que
+// ningún umbral sea un número mágico en dólares.
+float trueRange = na(close[1]) ? high - low
+     : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+float volUnit = math.max(math.sum(trueRange, volLen) / volLen, syminfo.mintick)
+
+int   barSecs  = math.max(timeframe.in_seconds(timeframe.period), 1)
+int   lookback = math.min(math.max(int(lookbackDays * 86400 / barSecs), 30), 4000)
+float avgVol   = math.max(math.sum(volume, lookback) / lookback, 1e-8)
+
+roundStep(float px) =>
+    float d = math.floor(math.log10(math.max(math.abs(px), 1e-12)))
+    math.pow(10, d - 1)
+
+float stepMajor = roundStep(close)
+float stepMinor = stepMajor / 10.0
+
+// Los números que la gente recuerda son los números donde la gente deja órdenes.
+roundPull(float px) =>
+    float dMaj = math.abs(px - math.round(px / stepMajor) * stepMajor) / math.max(stepMajor / 2.0, 1e-12)
+    float dMin = math.abs(px - math.round(px / stepMinor) * stepMinor) / math.max(stepMinor / 2.0, 1e-12)
+    math.max(1.0 - math.min(dMaj, 1.0), 0.5 * (1.0 - math.min(dMin, 1.0)))
+
+norm(float v, float lo, float hi) =>
+    na(v) ? na : math.max(0.0, math.min(100.0, (v - lo) / math.max(hi - lo, 1e-8) * 100.0))
+
+//══════════════════════════════════════════════════════════════════════════════
+//  MAPA DE LIQUIDEZ
+//══════════════════════════════════════════════════════════════════════════════
+type Pool
+    float price
+    int   side
+    int   touches    = 1
+    float pmin       = na
+    float pmax       = na
+    float volAcc     = 0.0
+    int   bornBar    = 0
+    bool  structural = false
+    bool  raided     = false
+    int   raidBar    = 0
+    int   outcome    = 0        // 0 intacto | 1 barrido | 2 roto
+    int   outBar     = 0
+    float score      = 0.0
+    line  ln         = na
+
+var array<Pool> poolsUp = array.new<Pool>()
+var array<Pool> poolsDn = array.new<Pool>()
+
+// Swing propio. La comparación a los lados es estricta (>) para que los máximos
+// IGUALES no se descarten: un doble techo perfecto es un cartel de neón que
+// anuncia dónde están los stops.
+isSwingHigh(int L) =>
+    bool ok = true
+    float p = high[L]
+    if na(p)
+        ok := false
+    else
+        for i = 0 to 2 * L
+            if i != L and high[i] > p
+                ok := false
+                break
+    ok
+
+isSwingLow(int L) =>
+    bool ok = true
+    float p = low[L]
+    if na(p)
+        ok := false
+    else
+        for i = 0 to 2 * L
+            if i != L and low[i] < p
+                ok := false
+                break
+    ok
+
+// Volumen alto con mecha larga = mucha gente entró y quedó del lado equivocado.
+wickShare(int off) =>
+    float rng = high[off] - low[off]
+    rng <= 0 ? 0.0 :
+     ((high[off] - math.max(open[off], close[off])) + (math.min(open[off], close[off]) - low[off])) / rng
+
+// Un nivel tocado tres veces no son tres niveles débiles: es un nivel fuerte y
+// tres grupos de stops apilados.
+addOrMerge(array<Pool> arr, float px, int side, int atBar, float volAdd, bool isStruct) =>
+    float tol = volUnit * clusterTol
+    Pool  hit = na
+    int   n   = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and math.abs(p.price - px) <= tol
+                hit := p
+                break
+    // El retorno se declara antes del if: si el if/else fuera la última
+    // expresión, Pine intentaría unificar el tipo de las dos ramas y no compila.
+    bool isNew = na(hit)
+    if isNew
+        array.push(arr, Pool.new(price = px, side = side, pmin = px, pmax = px,
+             volAcc = volAdd, bornBar = atBar, structural = isStruct))
+    else
+        hit.price      := (hit.price * hit.touches + px) / (hit.touches + 1)
+        hit.touches    += 1
+        hit.pmin       := math.min(hit.pmin, px)
+        hit.pmax       := math.max(hit.pmax, px)
+        hit.volAcc     += volAdd
+        hit.structural := hit.structural or isStruct
+    isNew
+
+// Niveles que salen en cada informe y que ve cualquiera con una plataforma.
+// Idioma no repintable: valor ya cerrado ([1]) + lookahead_on.
+pdh = useStruct ? request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on) : na
+pdl = useStruct ? request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on) : na
+pwh = useStruct ? request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on) : na
+pwl = useStruct ? request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on) : na
+
+if barstate.isconfirmed
+    if isSwingHigh(swingLen)
+        addOrMerge(poolsUp, high[swingLen],  1, bar_index - swingLen, volume[swingLen] * wickShare(swingLen), false)
+    if isSwingLow(swingLen)
+        addOrMerge(poolsDn, low[swingLen],  -1, bar_index - swingLen, volume[swingLen] * wickShare(swingLen), false)
+    if useStruct
+        if not na(pdh) and pdh != nz(pdh[1], -1.0)
+            addOrMerge(poolsUp, pdh,  1, bar_index, avgVol * 0.5, true)
+        if not na(pwh) and pwh != nz(pwh[1], -1.0)
+            addOrMerge(poolsUp, pwh,  1, bar_index, avgVol * 0.8, true)
+        if not na(pdl) and pdl != nz(pdl[1], -1.0)
+            addOrMerge(poolsDn, pdl, -1, bar_index, avgVol * 0.5, true)
+        if not na(pwl) and pwl != nz(pwl[1], -1.0)
+            addOrMerge(poolsDn, pwl, -1, bar_index, avgVol * 0.8, true)
+
+// Cinco preguntas, cada una entre 0 y 1: cuánta gente dejó órdenes aquí, qué
+// tan obvio es el nivel, cuánto capital quedó atrapado, si es un número que la
+// gente recuerda, y si está al alcance.
+method rescore(Pool p) =>
+    float s = 0.0
+    if p.outcome == 0
+        float sTouch = math.min(p.touches / 4.0, 1.0)
+        float spread = nz(p.pmax - p.pmin, 0.0)
+        float sTight = p.touches < 2 ? 0.35 : math.max(0.0, 1.0 - spread / math.max(volUnit * tightTol, 1e-8))
+        float sVol   = math.min(p.volAcc / math.max(avgVol * 1.5 * p.touches, 1e-8), 1.0)
+        float sRound = roundPull(p.price)
+        float sProx  = math.exp(-math.abs(p.price - close) / math.max(volUnit * 10.0, 1e-8))
+        float raw    = 25 * sTouch + 20 * sTight + 20 * sVol + 15 * sRound + 20 * sProx
+        s := math.min(raw * (p.structural ? 1.15 : 1.0), 100.0)
+    p.score := s
+
+// El barrido más reciente con magnetismo suficiente: el disparador de todo.
+var float lastSweepPx    = na
+var float lastSweepScore = 0.0
+var float lastSweepExt   = na   // extremo de la mecha = invalidación
+var int   lastSweepBar   = -1
+var int   lastSweepSide  = 0    // +1 barrido arriba (→ setup bajista)
+
+// BARRIDO → perforó y cerró de vuelta dentro: la liquidez se cobró y el
+//           movimiento era mentira. Es la trampa.
+// ROTURA  → perforó y se quedó fuera: la liquidez se cobró pero el movimiento
+//           era real. Es continuación.
+// Confundirlas es la forma más rápida de perder dinero con esta lógica.
+resolvePools(array<Pool> arr, int side) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0
+                bool pierced = side == 1 ? high > p.price : low < p.price
+                if not p.raided and pierced
+                    p.raided  := true
+                    p.raidBar := bar_index
+                if p.raided
+                    bool backInside = side == 1 ? close < p.price : close > p.price
+                    if backInside
+                        p.outcome := 1
+                        p.outBar  := bar_index
+                        // Barrer un nivel que no le importa a nadie no es una
+                        // trampa, es ruido.
+                        if p.score >= minPoolScore
+                            lastSweepPx    := p.price
+                            lastSweepScore := p.score
+                            lastSweepExt   := side == 1 ? high : low
+                            lastSweepBar   := bar_index
+                            lastSweepSide  := side
+                    else if bar_index - p.raidBar >= reclaimBars
+                        p.outcome := 2
+                        p.outBar  := bar_index
+
+prune(array<Pool> arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            Pool p = array.get(arr, i)
+            if bar_index - p.bornBar > lookback or (p.outcome != 0 and bar_index - p.outBar > lookback / 6)
+                if not na(p.ln)
+                    line.delete(p.ln)
+                array.remove(arr, i)
+    int alive = 0
+    int m = array.size(arr)
+    if m > 0
+        for i = 0 to m - 1
+            if array.get(arr, i).outcome == 0
+                alive += 1
+    while alive > maxPools
+        int   wi = -1
+        float ws = 1e18
+        int   k  = array.size(arr)
+        if k > 0
+            for i = 0 to k - 1
+                Pool p = array.get(arr, i)
+                if p.outcome == 0 and p.score < ws
+                    ws := p.score
+                    wi := i
+        if wi < 0
+            break
+        Pool w = array.get(arr, wi)
+        if not na(w.ln)
+            line.delete(w.ln)
+        array.remove(arr, wi)
+        alive -= 1
+
+if barstate.isconfirmed
+    int nu = array.size(poolsUp)
+    if nu > 0
+        for i = 0 to nu - 1
+            array.get(poolsUp, i).rescore()
+    int nd = array.size(poolsDn)
+    if nd > 0
+        for i = 0 to nd - 1
+            array.get(poolsDn, i).rescore()
+    resolvePools(poolsUp, 1)
+    resolvePools(poolsDn, -1)
+    prune(poolsUp)
+    prune(poolsDn)
+
+// Objetivo de un trade: el pool de más magnetismo REALMENTE por delante del
+// precio. Sin este filtro se podría apuntar a un nivel que ya quedó atrás y el
+// R:R saldría inventado.
+targetPool(array<Pool> arr, int d, float fromPx) =>
+    float bp = na
+    float bs = -1.0
+    int   n  = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            bool beyond = d > 0 ? p.price > fromPx : p.price < fromPx
+            if p.outcome == 0 and beyond and p.score > bs
+                bs := p.score
+                bp := p.price
+    bp
+
+// Pool más cercano por lado: el candidato a emboscada.
+nearestPool(array<Pool> arr, int side) =>
+    float bp = na
+    float bs = 0.0
+    float bd = 1e18
+    int   n  = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            if p.outcome == 0 and p.score >= ambushMin
+                float d = side == 1 ? p.price - close : close - p.price
+                if d > 0 and d < bd
+                    bd := d
+                    bp := p.price
+                    bs := p.score
+    [bp, bs, bd]
+
+[nearUpPx, nearUpSc, nearUpD] = nearestPool(poolsUp, 1)
+[nearDnPx, nearDnSc, nearDnD] = nearestPool(poolsDn, -1)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  FILTRO DE MANIPULABILIDAD
+//══════════════════════════════════════════════════════════════════════════════
+// Si el activo no perfora extremos obvios para cerrar de vuelta, no hay materia
+// prima. Ninguna estrategia que cace trampas funciona donde no se tienden.
+float hhN = ta.highest(high, swN)[1]
+float llN = ta.lowest(low,   swN)[1]
+float swUp = (not na(hhN) and high > hhN and close < hhN) ? 1.0 : 0.0
+float swDn = (not na(llN) and low  < llN and close > llN) ? 1.0 : 0.0
+float sweepRate = math.sum(swUp + swDn, lookback) / lookback * 100.0
+
+float barRng  = high - low
+float wickRaw = barRng <= 0 ? 0.0
+     : ((high - math.max(open, close)) + (math.min(open, close) - low)) / barRng
+float wickAvg = math.sum(wickRaw, lookback) / lookback
+
+float netMv  = math.abs(close - close[lookback])
+float pathMv = math.sum(math.abs(close - close[1]), lookback)
+float ineff  = pathMv > 0 ? 1.0 - netMv / pathMv : 0.0
+
+float eqUp = (not na(hhN) and math.abs(high - hhN) <= volUnit * 0.25) ? 1.0 : 0.0
+float eqDn = (not na(llN) and math.abs(low  - llN) <= volUnit * 0.25) ? 1.0 : 0.0
+float eqRate = math.sum(eqUp + eqDn, lookback) / lookback * 100.0
+
+// Open Interest: apalancamiento por cada dólar real negociado. Es lo más cerca
+// que se puede estar de leer el posicionamiento de la multitud sin adivinar.
+// Si el feed no resuelve, su peso se reparte en vez de contarse como cero.
+string oiSym = oiInput == "" ? syminfo.tickerid + "_OI" : oiInput
+float  oi    = request.security(oiSym, timeframe.period, close, ignore_invalid_symbol = true)
+bool   hasOI = not na(oi)
+float  volMA = math.max(math.sum(volume, lookback) / lookback, 1e-8)
+float  cFuel = hasOI ? ta.percentrank(oi / volMA, lookback) : na
+
+float cSweep = norm(sweepRate, 1.0,  8.0)
+float cWick  = norm(wickAvg,   0.30, 0.70)
+float cIneff = norm(ineff,     0.75, 0.98)
+float cEq    = norm(eqRate,    2.0,  15.0)
+
+float mW = 22 + 14 + 12 + 12
+float mV = 22 * cSweep + 14 * cWick + 12 * cIneff + 12 * cEq
+if hasOI
+    mW += 22
+    mV += 22 * cFuel
+float manipIdx  = mW > 0 ? mV / mW : na
+bool  manipPass = not manipOn or (not na(manipIdx) and manipIdx >= manipMin)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  RÉGIMEN, RANGO Y SESIÓN
+//══════════════════════════════════════════════════════════════════════════════
+// Eficiencia del camino: distancia neta partido camino recorrido. Si el precio
+// anduvo mucho para avanzar poco, es rango; si avanzó casi recto, es tendencia.
+// Pura geometría del recorrido, sin medias ni osciladores.
+float netMove  = close - close[effLen]
+float pathMove = math.sum(math.abs(close - close[1]), effLen)
+float pathEff  = pathMove > 0 ? math.abs(netMove) / pathMove : 0.0
+int   regime   = pathEff >= effThresh ? (netMove > 0 ? 1 : -1) : 0
+string regTxt  = regime == 1 ? "TENDENCIA ↑" : regime == -1 ? "TENDENCIA ↓" : "RANGO"
+
+// Mitad superior = PREMIUM (zona cara: ahí se reparte). Mitad inferior =
+// DESCUENTO (ahí se acumula). Comprar en premium es pagar el precio del que
+// llega tarde.
+float rngHi  = ta.highest(high, lookback)
+float rngLo  = ta.lowest(low,   lookback)
+float rngPos = rngHi > rngLo ? (close - rngLo) / (rngHi - rngLo) * 100.0 : 50.0
+string zone  = rngPos >= 65 ? "PREMIUM" : rngPos <= 35 ? "DESCUENTO" : "EQUILIBRIO"
+
+// Un barrido en la apertura de Londres no vale lo mismo que uno a las tres de
+// la madrugada de un sábado.
+int    hUTC   = hour(time, "UTC")
+bool   inKill = (hUTC >= lonStart and hUTC < lonEnd) or (hUTC >= nyStart and hUTC < nyEnd)
+float  sessW  = not sessOn ? 1.0 : inKill ? wKill : wOff
+
+//══════════════════════════════════════════════════════════════════════════════
+//  DESPLAZAMIENTO
+//══════════════════════════════════════════════════════════════════════════════
+// Se mide sobre tres barras: el hueco entre la mecha de la primera y la de la
+// tercera es la ineficiencia que dejó el movimiento — la huella de que alguien
+// movió precio sin esperar contraparte. Implica un retardo de una barra, y es
+// honesto: sin las tres barras cerradas el hueco no existe todavía. El T1 está
+// precisamente para no depender de él.
+float bodyMid  = math.abs(close[1] - open[1])
+bool  bigBody  = bodyMid >= dispMult * volUnit
+bool  bullFVG  = low > high[2]
+bool  bearFVG  = high < low[2]
+bool  bullDisp = bigBody and close[1] > open[1] and (not requireFVG or bullFVG)
+bool  bearDisp = bigBody and close[1] < open[1] and (not requireFVG or bearFVG)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  MÁQUINA DE ESTADOS DE LA TRAMPA
+//══════════════════════════════════════════════════════════════════════════════
+type Setup
+    int   dir       = 0
+    int   state     = 0      // 1 barrido · 2 armado · 3 gatillo · 4 muerto
+    float poolPx    = na
+    float poolScore = 0.0
+    float invalid   = na
+    int   sweepBar  = 0
+    int   dispBar   = 0
+    float zTop      = na
+    float zBot      = na
+    float t1        = na
+    float t2        = na
+    float t3        = na
+    float entryAvg  = na
+    float stop      = na
+    float target    = na
+    float rr        = 0.0
+    float rrT2      = 0.0
+    float rrT3      = 0.0
+    float score     = 0.0
+    bool  blocked   = false
+    box   bx        = na
+
+var Setup cur = na
+
+// Pine no permite el operador de historial sobre campos de un objeto
+// (`cur.state[1]` no existe), así que el estado previo se guarda a mano y se
+// actualiza en la última línea del script.
+var int prevState = 0
+
+bool newSweep = barstate.isconfirmed and lastSweepBar == bar_index
+
+if newSweep
+    if not na(cur)
+        if not na(cur.bx)
+            box.delete(cur.bx)
+    // La dirección del setup es SIEMPRE contraria al barrido: si se cobraron
+    // los stops de arriba, el destino está abajo.
+    cur := Setup.new(dir = -lastSweepSide, state = 1, poolPx = lastSweepPx,
+         poolScore = lastSweepScore, invalid = lastSweepExt, sweepBar = bar_index)
+
+if not na(cur) and barstate.isconfirmed
+    // El setup nunca avanza en la barra en que nació: el desplazamiento se mide
+    // sobre tres barras y en la barra del barrido esas tres son ANTERIORES a la
+    // trampa. Confirmar con ellas sería leer el pasado creyendo que es futuro.
+    if cur.state == 1 and bar_index > cur.sweepBar
+        bool broke   = cur.dir > 0 ? close < cur.invalid : close > cur.invalid
+        bool timeout = bar_index - cur.sweepBar > dispWindow
+        if broke or timeout
+            cur.state := 4
+        else
+            bool disp = cur.dir > 0 ? bullDisp : bearDisp
+            if disp
+                cur.state   := 2
+                cur.dispBar := bar_index
+
+                // Zona de retroceso: el hueco si existe; si no, el tramo
+                // 0.618-0.79 de la pata del desplazamiento.
+                if cur.dir > 0 and bullFVG
+                    cur.zBot := high[2]
+                    cur.zTop := low
+                else if cur.dir < 0 and bearFVG
+                    cur.zTop := low[2]
+                    cur.zBot := high
+                else
+                    float legLo = math.min(math.min(low, low[1]), low[2])
+                    float legHi = math.max(math.max(high, high[1]), high[2])
+                    float leg   = legHi - legLo
+                    cur.zBot := cur.dir > 0 ? legLo + leg * 0.21 : legLo + leg * 0.62
+                    cur.zTop := cur.dir > 0 ? legLo + leg * 0.38 : legLo + leg * 0.79
+
+                cur.t1 := cur.poolPx - cur.dir * ambushDepth * volUnit
+                cur.t2 := close
+                cur.t3 := (cur.zTop + cur.zBot) / 2.0
+
+                // Stop detrás de la mecha del barrido: si esa mecha se pierde,
+                // la lectura entera estaba equivocada.
+                cur.stop   := cur.invalid - cur.dir * stopPad * volUnit
+                cur.target := cur.dir > 0 ? targetPool(poolsUp, 1, close) : targetPool(poolsDn, -1, close)
+
+                // El R:R se mide sobre la entrada promedio ponderada, no sobre
+                // T2. T2 es por construcción el peor precio de los tres, y
+                // juzgar la operación por él descarta setups excelentes.
+                float wT = math.max(szT1 + szT2 + szT3, 1e-8)
+                cur.entryAvg := (szT1 * cur.t1 + szT2 * cur.t2 + szT3 * cur.t3) / wT
+
+                float riskAvg = math.abs(cur.entryAvg - cur.stop)
+                float riskT2  = math.abs(cur.t2 - cur.stop)
+                float riskT3  = math.abs(cur.t3 - cur.stop)
+                bool  hasTgt  = not na(cur.target)
+                cur.rr   := (hasTgt and riskAvg > 0) ? math.abs(cur.target - cur.entryAvg) / riskAvg : 0.0
+                cur.rrT2 := (hasTgt and riskT2  > 0) ? math.abs(cur.target - cur.t2)       / riskT2  : 0.0
+                cur.rrT3 := (hasTgt and riskT3  > 0) ? math.abs(cur.target - cur.t3)       / riskT3  : 0.0
+
+                //──────────────── SCORING DEL SETUP (0-100) ────────────────
+                float sMagnet = cur.poolScore / 100.0
+                // En rango el barrido revierte; en tendencia solo vale si
+                // resuelve A FAVOR de la corriente.
+                float sReg = regime == 0 ? 0.75 : regime == cur.dir ? 1.0 : 0.0
+                cur.blocked := regime != 0 and regime != cur.dir and counterMode == "Bloquear"
+                float sDisp = math.min(bodyMid / math.max(dispMult * volUnit, 1e-8) / 1.5, 1.0)
+                float sPD   = cur.dir > 0 ? (100.0 - rngPos) / 100.0 : rngPos / 100.0
+                float sRR   = math.min(cur.rr / math.max(rrFull, 1e-8), 1.0)
+
+                float wSum = math.max(wMagnet + wRegime + wDisp + wPD + wRR + wSess, 1e-8)
+                float raw  = wMagnet * sMagnet + wRegime * sReg + wDisp * sDisp +
+                     wPD * sPD + wRR * sRR + wSess * sessW
+                cur.score := math.min(100.0 * raw / wSum, 100.0)
+
+                if cur.blocked or cur.rr < rrMin
+                    cur.state := 4
+
+    else if cur.state == 2
+        bool broke   = cur.dir > 0 ? close < cur.invalid : close > cur.invalid
+        bool timeout = bar_index - cur.dispBar > armWindow
+        bool tapped  = low <= cur.zTop and high >= cur.zBot
+        if broke or timeout
+            cur.state := 4
+        else if tapped
+            cur.state := 3
+
+    else if cur.state == 3
+        bool broke = cur.dir > 0 ? close < cur.stop : close > cur.stop
+        bool done  = not na(cur.target) and (cur.dir > 0 ? high >= cur.target : low <= cur.target)
+        if broke or done
+            cur.state := 4
+
+//──────────────────────── ESPEJO ESCALAR DEL SETUP ────────────────────────────
+// Pine puede evaluar las dos ramas de una condición o de un ternario, así que
+// tocar `cur.campo` en una expresión que llega a ejecutarse cuando `cur` es na
+// provoca un error de objeto indefinido en pleno backtest. Todo lo que va aguas
+// abajo lee estas variables planas y no vuelve a tocar el objeto.
+var int   sState   = 0
+var int   sDir     = 0
+var float sScore   = 0.0
+var float sStop    = na
+var float sT3      = na
+var float sTarget  = na
+var float sRR      = 0.0
+var float sZTop    = na
+var float sZBot    = na
+var int   sDispBar = 0
+var bool  sBlocked = false
+
+if na(cur)
+    sState   := 0
+    sDir     := 0
+    sScore   := 0.0
+    sBlocked := false
+else
+    sState   := cur.state
+    sDir     := cur.dir
+    sScore   := cur.score
+    sStop    := cur.stop
+    sT3      := cur.t3
+    sTarget  := cur.target
+    sRR      := cur.rr
+    sZTop    := cur.zTop
+    sZBot    := cur.zBot
+    sDispBar := cur.dispBar
+    sBlocked := cur.blocked
+
+//══════════════════════════════════════════════════════════════════════════════
+//  TAMAÑO DE POSICIÓN
+//══════════════════════════════════════════════════════════════════════════════
+// El tamaño lo decide el score, no la corazonada. Por debajo del mínimo no se
+// opera; en el score completo se arriesga el porcentaje configurado; en medio,
+// una rampa lineal.
+multFromScore(float s, float floorScore) =>
+    float m = 0.0
+    if s >= floorScore
+        float t = math.min((s - floorScore) / math.max(fullScore - floorScore, 1e-8), 1.0)
+        m := minMult + (1.0 - minMult) * t
+    m
+
+// Riesgo fijo en dinero convertido a unidades mediante la distancia al stop.
+// Un stop más lejano da menos tamaño, no más riesgo.
+qtyFor(float price, float stopPx, float share, float mult) =>
+    float dist = math.abs(price - stopPx)
+    float q = 0.0
+    if dist > 0 and mult > 0 and share > 0
+        q := strategy.equity * (riskPct / 100.0) * mult * (share / 100.0) / dist
+    math.max(q, 0.0)
+
+//══════════════════════════════════════════════════════════════════════════════
+//  ENTRADAS
+//══════════════════════════════════════════════════════════════════════════════
+// Mientras haya posición solo se admiten añadidos en la MISMA dirección. Un
+// setup contrario no da la vuelta a la posición: la escalera gestiona la salida.
+canEnter(int d) =>
+    strategy.position_size == 0 or (strategy.position_size > 0 ? d > 0 : d < 0)
+
+bool tradingOK = manipPass and barstate.isconfirmed
+
+//─────────────────────── T1 · EMBOSCADA ───────────────────────────────────────
+// Órdenes límite descansando dentro del pool, colocadas antes de que llegue el
+// precio. Es lo que hace el dinero grande: no reacciona a la cascada de stops,
+// es su contraparte. Se recolocan cada barra para seguir al pool.
+float ambSellPx = (not na(nearUpPx) and nearUpD <= ambushDist * volUnit) ? nearUpPx + ambushDepth * volUnit : na
+float ambBuyPx  = (not na(nearDnPx) and nearDnD <= ambushDist * volUnit) ? nearDnPx - ambushDepth * volUnit : na
+float ambSellSL = na(ambSellPx) ? na : ambSellPx + ambushStop * volUnit
+float ambBuySL  = na(ambBuyPx)  ? na : ambBuyPx  - ambushStop * volUnit
+
+// La emboscada se cancela y se recoloca en cada barra para seguir al pool, pero
+// SOLO con la posición plana. Si ya se llenó, volver a emitir la misma orden
+// duplicaría la posición: `strategy.cancel` sobre una orden ya ejecutada no
+// hace nada, y el `strategy.entry` siguiente abriría otra.
+strategy.cancel("T1L")
+strategy.cancel("T1S")
+
+bool flat = strategy.position_size == 0
+
+if useT1 and tradingOK and flat
+    if allowL and not na(ambBuyPx)
+        float q = qtyFor(ambBuyPx, ambBuySL, szT1, multFromScore(nearDnSc, ambushMin))
+        if q > 0
+            strategy.entry("T1L", strategy.long, qty = q, limit = ambBuyPx, comment = "T1 emboscada")
+    if allowS and not na(ambSellPx)
+        float q = qtyFor(ambSellPx, ambSellSL, szT1, multFromScore(nearUpSc, ambushMin))
+        if q > 0
+            strategy.entry("T1S", strategy.short, qty = q, limit = ambSellPx, comment = "T1 emboscada")
+
+//──────────────────── T2 · CONFIRMACIÓN  y  T3 · RETROCESO ────────────────────
+// Ambos se emiten UNA sola vez, en la barra en que el setup se arma. El precio
+// de T3 queda fijado en ese momento y no cambia después, así que recolocarlo
+// cada barra no aportaría nada y sí arriesgaría un doble llenado.
+bool  setupLive = sState == 2 or sState == 3
+bool  armedNow  = sState == 2 and prevState != 2 and sScore >= minScore
+bool  dirOK     = (sDir > 0 and allowL) or (sDir < 0 and allowS)
+float setupMult = multFromScore(sScore, minScore)
+
+// El T3 pendiente muere con su setup.
+if not setupLive
+    strategy.cancel("T3L")
+    strategy.cancel("T3S")
+
+if tradingOK and armedNow and dirOK and canEnter(sDir) and not na(sStop)
+    if useT2
+        float q = qtyFor(close, sStop, szT2, setupMult)
+        if q > 0
+            strategy.entry(sDir > 0 ? "T2L" : "T2S", sDir > 0 ? strategy.long : strategy.short,
+                 qty = q, comment = "T2 confirmación")
+    if useT3 and not na(sT3)
+        float q = qtyFor(sT3, sStop, szT3, setupMult)
+        if q > 0
+            strategy.entry(sDir > 0 ? "T3L" : "T3S", sDir > 0 ? strategy.long : strategy.short,
+                 qty = q, limit = sT3, comment = "T3 retroceso")
+
+//══════════════════════════════════════════════════════════════════════════════
+//  ESCALERA DE SALIDA
+//══════════════════════════════════════════════════════════════════════════════
+//  Al conquistar el peldaño k, el piso pasa al peldaño k-2, siendo el peldaño 0
+//  la entrada. Entrada 100 / SL 95 / TPs 105-110-115-120 →
+//  TP1 sube el piso a 100, TP2 a 105, TP3 a 110, TP4 a 115.
+//
+//  Se mueve por CONQUISTA, no por proximidad. Un trailing continuo te saca en
+//  el primer retroceso, y el retroceso es exactamente lo que provoca quien
+//  maneja el gráfico.
+var int   ladDir     = 0
+var float ladEntry   = na   // entrada media viva: ancla de los peldaños
+var float ladAmbStop = na   // stop de la emboscada, fijado en la primera entrada
+var float ladBase    = na   // protección vigente
+var float ladR       = na   // unidad de los objetivos
+var float ladFloor   = na   // piso vigente
+var int   rung       = 0
+var array<float> tps = array.new<float>()
+
+buildTargets(float ep, float risk, int d) =>
+    array<float> out = array.new<float>()
+    if tpMode == "Múltiplos de R"
+        for k = 1 to nRungs
+            array.push(out, ep + d * risk * rStep * k)
+    else
+        // Cada peldaño en el siguiente depósito de stops: el objetivo tiene una
+        // razón de existir en vez de ser un número bonito.
+        array<Pool> src  = d > 0 ? poolsUp : poolsDn
+        array<float> cand = array.new<float>()
+        int ns = array.size(src)
+        if ns > 0
+            for i = 0 to ns - 1
+                Pool p = array.get(src, i)
+                if p.outcome == 0 and (d > 0 ? p.price > ep + risk * minGap : p.price < ep - risk * minGap)
+                    array.push(cand, p.price)
+        while array.size(cand) > 0 and array.size(out) < nRungs
+            int   bi = 0
+            float bv = array.get(cand, 0)
+            int   nc = array.size(cand)
+            if nc > 1
+                for i = 1 to nc - 1
+                    float v = array.get(cand, i)
+                    if d > 0 ? v < bv : v > bv
+                        bv := v
+                        bi := i
+            float last = array.size(out) == 0 ? ep : array.get(out, array.size(out) - 1)
+            if math.abs(bv - last) >= risk * minGap
+                array.push(out, bv)
+            array.remove(cand, bi)
+        // Sin suficientes pools se completa con múltiplos de R para no dejar la
+        // escalera coja.
+        while array.size(out) < nRungs
+            float last = array.size(out) == 0 ? ep : array.get(out, array.size(out) - 1)
+            array.push(out, last + d * risk * rStep)
+    out
+
+// El piso según el peldaño conquistado. Ésta es LA regla, en una línea.
+ladderStop() =>
+    float s = ladBase
+    if rung == 1
+        // Umbral de no perder: la entrada MEDIA de la posición, no la primera.
+        // Así el "no puede perder" es cierto aunque hayan entrado varios tramos.
+        s := strategy.position_avg_price
+    else if rung >= 2
+        int idx = rung - 2
+        int n   = array.size(tps)
+        s := idx < n ? array.get(tps, idx)
+             : n > 0 ? array.get(tps, n - 1) + ladDir * ladR * rStep * (idx - n + 1) : ladBase
+    s
+
+nextTarget() =>
+    float t = na
+    int   n = array.size(tps)
+    if rung < n
+        t := array.get(tps, rung)
+    else if not exitFin and n > 0
+        t := array.get(tps, n - 1) + ladDir * ladR * rStep * (rung - n + 1)
+    t
+
+bool inTrade    = strategy.position_size != 0
+bool justOpened = inTrade and nz(strategy.position_size[1], 0) == 0
+bool justClosed = not inTrade and nz(strategy.position_size[1], 0) != 0
+
+if justOpened
+    ladDir   := strategy.position_size > 0 ? 1 : -1
+    ladBase  := na
+    ladFloor := na
+    rung     := 0
+    // El stop de la emboscada se fija en el precio de la PRIMERA entrada y no
+    // se vuelve a tocar. Recalcularlo sobre la entrada media haría que subiera
+    // solo porque han llenado más tramos, estrangulando el trade a una
+    // distancia que no corresponde a ninguna estructura del gráfico.
+    ladAmbStop := strategy.position_avg_price - ladDir * ambushStop * volUnit
+
+// Mientras no se haya conquistado ningún peldaño, la escalera se resincroniza
+// con la entrada media real. Hace falta porque los tramos llenan en momentos
+// distintos: si la posición se abrió con una emboscada suelta y el setup se
+// confirma después, los peldaños tienen que rehacerse sobre la posición
+// completa. En cuanto se conquista el primer peldaño, todo se congela: a partir
+// de ahí los peldaños son compromisos adquiridos y moverlos rompería la promesa
+// del piso.
+if inTrade and rung == 0
+    ladEntry := strategy.position_avg_price
+    // Stop estructural del setup, si hay uno vivo en la misma dirección.
+    float sSetup = (sState == 2 or sState == 3) and sDir == ladDir ? sStop : na
+    // Stop de la emboscada, fijo desde la primera entrada.
+    float sAmb   = ladAmbStop
+
+    // PROTECCIÓN: el más ajustado de los disponibles, y nunca se ensancha. Que
+    // el setup confirme no es motivo para arriesgar más de lo ya comprometido.
+    float cand = na(sSetup) ? sAmb : (ladDir > 0 ? math.max(sSetup, sAmb) : math.min(sSetup, sAmb))
+    ladBase := na(ladBase) ? cand : (ladDir > 0 ? math.max(ladBase, cand) : math.min(ladBase, cand))
+
+    // UNIDAD DE LOS OBJETIVOS: el riesgo ESTRUCTURAL, no el de la emboscada.
+    // Son cosas distintas y mezclarlas fue un error: el stop del T1 es diminuto
+    // a propósito, y si los peldaños se midieran con él caerían pegados a la
+    // entrada y el trade se cerraría en el último peldaño sin haberse acercado
+    // al depósito de liquidez al que iba.
+    float rRef = na(sSetup) ? sAmb : sSetup
+    ladR := math.max(math.abs(ladEntry - rRef), syminfo.mintick)
+    tps  := buildTargets(ladEntry, ladR, ladDir)
+
+// ─── Avance de peldaños ───
+// Un peldaño se conquista cuando el precio LO ALCANZA, no cuando se le acerca.
+// En modo conservador se evalúa con los extremos de la barra ya cerrada: dentro
+// de una barra Pine no sabe qué ocurrió primero, y asumir lo favorable es la
+// forma más común de fabricar un backtest que no existe.
+float probeHi = consInt ? nz(high[1], high) : high
+float probeLo = consInt ? nz(low[1],  low)  : low
+
+if inTrade and not justOpened
+    bool advanced = true
+    int  guard    = 0
+    while advanced and guard < 50
+        guard    += 1
+        advanced := false
+        float t = nextTarget()
+        if not na(t)
+            bool reached = ladDir > 0 ? probeHi >= t : probeLo <= t
+            if reached and (rung < array.size(tps) or not exitFin)
+                rung     += 1
+                advanced := true
+                if partPct > 0
+                    // El parcial se aplica a los tres tramos por igual, que es
+                    // lo mismo que aplicarlo al total: cerrar solo el tramo de
+                    // confirmación dejaría la emboscada corriendo entera.
+                    strategy.close(ladDir > 0 ? "T1L" : "T1S", qty_percent = partPct, comment = "Peldaño " + str.tostring(rung))
+                    strategy.close(ladDir > 0 ? "T2L" : "T2S", qty_percent = partPct, comment = "Peldaño " + str.tostring(rung))
+                    strategy.close(ladDir > 0 ? "T3L" : "T3S", qty_percent = partPct, comment = "Peldaño " + str.tostring(rung))
+
+if inTrade
+    float cand = ladderStop()
+    // Red de seguridad: el piso NUNCA baja. Toda la promesa de esta mecánica
+    // cabe en esta línea, así que se impone aquí de forma explícita en vez de
+    // confiarla a que el resto de la lógica sea correcta.
+    ladFloor := na(ladFloor) ? cand : (ladDir > 0 ? math.max(ladFloor, cand) : math.min(ladFloor, cand))
+
+float finTP = exitFin and array.size(tps) > 0 ? array.get(tps, array.size(tps) - 1) : na
+
+// Un `strategy.exit` por cada entrada posible: todos comparten el mismo piso y
+// el mismo último peldaño, así que el conjunto se comporta como una sola
+// posición. Los que no llegaron a llenarse son inocuos.
+if inTrade and not na(ladFloor)
+    if ladDir > 0
+        strategy.exit("X1L", from_entry = "T1L", stop = ladFloor, limit = finTP, comment_loss = "Piso perdido", comment_profit = "Último peldaño")
+        strategy.exit("X2L", from_entry = "T2L", stop = ladFloor, limit = finTP, comment_loss = "Piso perdido", comment_profit = "Último peldaño")
+        strategy.exit("X3L", from_entry = "T3L", stop = ladFloor, limit = finTP, comment_loss = "Piso perdido", comment_profit = "Último peldaño")
+    else
+        strategy.exit("X1S", from_entry = "T1S", stop = ladFloor, limit = finTP, comment_loss = "Piso perdido", comment_profit = "Último peldaño")
+        strategy.exit("X2S", from_entry = "T2S", stop = ladFloor, limit = finTP, comment_loss = "Piso perdido", comment_profit = "Último peldaño")
+        strategy.exit("X3S", from_entry = "T3S", stop = ladFloor, limit = finTP, comment_loss = "Piso perdido", comment_profit = "Último peldaño")
+
+if justClosed
+    ladDir   := 0
+    rung     := 0
+    ladEntry := na
+    ladBase  := na
+    ladR     := na
+    ladFloor := na
+    array.clear(tps)
+    strategy.cancel("T3L")
+    strategy.cancel("T3S")
+
+//══════════════════════════════════════════════════════════════════════════════
+//  VISUALIZACIÓN
+//══════════════════════════════════════════════════════════════════════════════
+// El piso, dibujado como una escalera literal. Nunca baja mientras el trade
+// vive, y conviene poder verificarlo de un vistazo en vez de creérselo.
+plot(inTrade ? ladFloor : na, "Piso", color.new(#ef5350, 0), 2, plot.style_stepline)
+plot(inTrade ? ladEntry : na, "Entrada", color.new(color.gray, 20), 1, plot.style_linebr)
+
+plot(sScore,   "Score del setup", display = display.data_window)
+plot(manipIdx, "Manipulabilidad", display = display.data_window)
+plot(ambBuyPx,                 "T1 compra",       display = display.data_window)
+plot(ambSellPx,                "T1 venta",        display = display.data_window)
+
+drawPools(array<Pool> arr, color base) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Pool p = array.get(arr, i)
+            color c = p.outcome != 0 ? color.new(color.gray, 78)
+                 : color.new(base, int(math.max(0, 75 - p.score * 0.6)))
+            int x2 = p.outcome != 0 ? p.outBar : bar_index + 6
+            if na(p.ln)
+                p.ln := line.new(p.bornBar, p.price, x2, p.price, xloc = xloc.bar_index,
+                     color = c, width = p.score >= 60 ? 2 : 1, style = line.style_dashed)
+            else
+                line.set_xy1(p.ln, p.bornBar, p.price)
+                line.set_xy2(p.ln, x2, p.price)
+                line.set_color(p.ln, c)
+
+if barstate.islast and showPools
+    drawPools(poolsUp, colSell)
+    drawPools(poolsDn, colBuy)
+
+var array<line> ladLines = array.new<line>()
+
+if barstate.islast and showSetup
+    while array.size(ladLines) > 0
+        line.delete(array.pop(ladLines))
+    if not na(cur)
+        if not na(cur.bx)
+            box.delete(cur.bx)
+            cur.bx := na
+    // Zona de retroceso del setup vivo.
+    if setupLive and not na(sZTop) and not na(cur)
+        color cz = sDir > 0 ? colBuy : colSell
+        cur.bx := box.new(sDispBar, sZTop, bar_index + 8, sZBot, xloc = xloc.bar_index,
+             border_color = color.new(cz, 40), bgcolor = color.new(cz, 88))
+    // Peldaños de la escalera.
+    if inTrade
+        int n = array.size(tps)
+        if n > 0
+            for k = 0 to n - 1
+                bool done = k < rung
+                array.push(ladLines, line.new(bar_index - 30, array.get(tps, k), bar_index + 8, array.get(tps, k),
+                     xloc = xloc.bar_index, color = done ? color.new(#26a69a, 20) : color.new(#26a69a, 68),
+                     width = done ? 2 : 1, style = done ? line.style_solid : line.style_dashed))
+
+//──────────────────────────────── PANEL ───────────────────────────────────────
+var table pnl = table.new(position.top_right, 2, 13,
+     border_color = color.new(color.gray, 70), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+row(int r, string k, string v, color cv) =>
+    table.cell(pnl, 0, r, k, text_size = size.small, text_color = color.new(color.gray, 10), text_halign = text.align_left,  bgcolor = color.new(color.black, 82))
+    table.cell(pnl, 1, r, v, text_size = size.small, text_color = cv,                        text_halign = text.align_right, bgcolor = color.new(color.black, 82))
+
+if barstate.islast and showTable
+    string stTxt = sState == 0 ? "sin setup"
+         : sState == 1 ? "BARRIDO · espera desplazamiento"
+         : sState == 2 ? "ARMADO · espera retroceso"
+         : sState == 3 ? "GATILLO" : "muerto"
+    color cDir = sDir == 0 ? color.new(color.gray, 10) : sDir > 0 ? colBuy : colSell
+    float lockedR = inTrade and not na(ladR) and ladR > 0 ? (ladFloor - ladEntry) * ladDir / ladR : na
+
+    table.cell(pnl, 0, 0, "MANIPULATOR", text_size = size.small, text_color = color.white, text_halign = text.align_left,  bgcolor = color.new(color.blue, 55))
+    table.cell(pnl, 1, 0, syminfo.ticker + " " + timeframe.period, text_size = size.small, text_color = color.white, text_halign = text.align_right, bgcolor = color.new(color.blue, 55))
+
+    row(1,  "Manipulabilidad", na(manipIdx) ? "—" : str.tostring(manipIdx, "#") + (manipPass ? "  ✓" : "  ✗ apagado"), manipPass ? colBuy : colSell)
+    row(2,  "Régimen",   regTxt + "  (ef " + str.tostring(pathEff, "#.##") + ")", regime == 0 ? color.new(color.orange, 10) : regime > 0 ? colBuy : colSell)
+    row(3,  "Zona",      zone + "  " + str.tostring(rngPos, "#") + "%", zone == "PREMIUM" ? colSell : zone == "DESCUENTO" ? colBuy : color.new(color.orange, 10))
+    row(4,  "Sesión",    sessOn ? (inKill ? "KILLZONE" : "fuera de horas") : "—", inKill ? colBuy : color.new(color.gray, 30))
+    row(5,  "Setup",     stTxt, cDir)
+    row(6,  "Score",     sState == 0 ? "—" : str.tostring(sScore, "#") + "/100" + (sBlocked ? "  ✗ régimen" : ""), sScore < minScore ? color.new(color.orange, 10) : colBuy)
+    row(7,  "R:R medio", sRR == 0 ? "—" : str.tostring(sRR, "#.#") + " : 1", sRR < rrMin ? color.new(color.orange, 10) : colBuy)
+    row(8,  "T1 límite", not na(ambBuyPx) ? "compra " + str.tostring(ambBuyPx, format.mintick) : not na(ambSellPx) ? "venta " + str.tostring(ambSellPx, format.mintick) : "—", color.new(color.yellow, 20))
+    row(9,  "Posición",  inTrade ? (ladDir > 0 ? "LARGO " : "CORTO ") + str.tostring(math.abs(strategy.position_size), format.volume) : "plana", inTrade ? cDir : color.new(color.gray, 30))
+    row(10, "Peldaño",   inTrade ? str.tostring(rung) + " / " + str.tostring(array.size(tps)) + (exitFin ? "" : "  ∞") : "—", color.new(color.gray, 10))
+    row(11, "Piso",      inTrade ? str.tostring(ladFloor, format.mintick) : "—", #ef5350)
+    row(12, "Bloqueado", na(lockedR) ? "—" : (lockedR > 0 ? "+" : "") + str.tostring(lockedR, "#.##") + " R",
+         na(lockedR) ? color.new(color.gray, 30) : lockedR > 0 ? colBuy : lockedR == 0 ? color.new(color.orange, 10) : colSell)
+
+//──────────────────────────────── ALERTAS ─────────────────────────────────────
+alertcondition(not na(ambBuyPx)  and na(ambBuyPx[1]),  "T1 · Emboscada compra", "Colocar límite de COMPRA dentro del pool inferior")
+alertcondition(not na(ambSellPx) and na(ambSellPx[1]), "T1 · Emboscada venta",  "Colocar límite de VENTA dentro del pool superior")
+alertcondition(armedNow, "T2 · Confirmación", "Trampa confirmada con desplazamiento")
+
+//──────────────────────── CIERRE DE BARRA ─────────────────────────────────────
+// Última línea a propósito: memoriza el estado para que la barra siguiente
+// detecte la transición. Si esto subiera, T2 se dispararía dos veces o ninguna.
+// Se escribe con if en lugar de ternario: un ternario podría evaluar la rama
+// del objeto cuando el objeto es na.
+if barstate.isconfirmed
+    if na(cur)
+        prevState := 0
+    else
+        prevState := cur.state
